@@ -1,0 +1,261 @@
+{% extends "base.html" %}
+
+{% block title %}Bảng điều khiển — External Auth Gateway{% endblock %}
+
+{% block content %}
+<div style="margin-bottom: 1.5rem;">
+  <h1 style="font-size: 1.5rem; font-weight: 700;">Bảng điều khiển cá nhân</h1>
+  <p style="font-size: 0.875rem; color: var(--text-muted);">
+    Quản lý liên kết tài khoản Odoo với Google Workspace và Telegram
+  </p>
+</div>
+
+{% if request.query_params.get('error') %}
+<div class="alert alert-danger" style="margin-bottom: 1rem;">
+  ⚠️ <strong>Lỗi kết nối:</strong> {{ request.query_params.get('error') }}
+</div>
+{% endif %}
+{% if request.query_params.get('status') == 'google_connected' %}
+<div class="alert alert-success" style="margin-bottom: 1rem; background: #e6f4ea; color: var(--success); border: 1px solid #ceead6;">
+  ✅ <strong>Kết nối Google Workspace thành công!</strong> Lịch Google của bạn đã được liên kết với Odoo.
+</div>
+{% endif %}
+{% if request.query_params.get('status') == 'sync_success' %}
+<div class="alert alert-success" style="margin-bottom: 1rem; background: #e6f4ea; color: var(--success); border: 1px solid #ceead6;">
+  ✅ <strong>{{ request.query_params.get('msg') or 'Đã đồng bộ lịch thành công!' }}</strong>
+</div>
+{% endif %}
+
+<div class="alert alert-info">
+  ℹ️ <strong>Lưu ý về phiên làm việc:</strong> Việc đăng xuất khỏi giao diện web này chỉ kết thúc phiên làm việc trên trình duyệt. Các tác vụ tự động (đồng bộ lịch, nhắc lịch họp Telegram) vẫn tiếp tục hoạt động ngầm. Để dừng hẳn, hãy bấm "Tạm dừng" hoặc "Ngắt kết nối" từng dịch vụ bên dưới.
+</div>
+
+<!-- 1. THÔNG TIN ODOO -->
+<div class="card">
+  <div class="card-title">
+    <span>Tài khoản Odoo</span>
+    <span class="badge badge-success">Đã xác thực</span>
+  </div>
+  <div class="table-responsive">
+    <table>
+      <tbody>
+        <tr>
+          <td style="width: 25%; font-weight: 500;">Họ và tên:</td>
+          <td><strong>{{ user.name }}</strong></td>
+          <td style="width: 25%; font-weight: 500;">Múi giờ:</td>
+          <td>{{ user.tz or 'Asia/Bangkok' }}</td>
+        </tr>
+        <tr>
+          <td style="font-weight: 500;">Email đăng nhập:</td>
+          <td>{{ user.login }}</td>
+          <td style="font-weight: 500;">Odoo Tenant:</td>
+          <td><code>{{ user.tenant }}</code> (UID: {{ user.odoo_uid }})</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="grid grid-2">
+  <!-- 2. GOOGLE WORKSPACE -->
+  <div class="card">
+    <div class="card-title">
+      <span>Google Workspace</span>
+      {% if google_conn and google_conn.status == 'connected' %}
+        <span class="badge badge-success">Đã kết nối</span>
+      {% elif google_conn and google_conn.status == 'reconnect_required' %}
+        <span class="badge badge-warning">Cần kết nối lại</span>
+      {% else %}
+        <span class="badge badge-secondary">Chưa kết nối</span>
+      {% endif %}
+    </div>
+
+    {% if google_conn and google_conn.status == 'connected' %}
+      <p style="font-size: 0.875rem; margin-bottom: 0.5rem;">
+        Email liên kết: <strong>{{ google_conn.email }}</strong>
+      </p>
+      <p style="font-size: 0.75rem; color: var(--text-muted); margin-bottom: 1rem;">
+        Quyền đã cấp: <code>{{ google_conn.scopes or 'calendar.events' }}</code>
+      </p>
+      <form action="/connections/google/disconnect" method="POST" onsubmit="return confirm('Bạn có chắc muốn ngắt kết nối Google Calendar? Các lịch đã tạo sẽ không bị xóa.');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn btn-danger">Ngắt kết nối Google</button>
+      </form>
+    {% else %}
+      <p style="font-size: 0.875rem; color: var(--text-muted); margin-bottom: 1rem;">
+        Kết nối tài khoản Google Workspace (chỉ hỗ trợ miền công ty) để tự động đồng bộ lịch hẹn với Odoo.
+      </p>
+      <form action="/connections/google/start" method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn btn-primary">Kết nối Google Workspace</button>
+      </form>
+    {% endif %}
+  </div>
+
+  <!-- 3. TELEGRAM BOT -->
+  <div class="card">
+    <div class="card-title">
+      <span>Telegram Bot</span>
+      {% if telegram_conn and telegram_conn.status == 'connected' %}
+        <span class="badge badge-success">Đã kết nối</span>
+      {% elif telegram_conn and telegram_conn.status == 'blocked' %}
+        <span class="badge badge-danger">Đã chặn Bot</span>
+      {% else %}
+        <span class="badge badge-secondary">Chưa kết nối</span>
+      {% endif %}
+    </div>
+
+    {% if telegram_conn and telegram_conn.status == 'connected' %}
+      <p style="font-size: 0.875rem; margin-bottom: 0.5rem;">
+        Chat ID: <strong>{{ telegram_conn.private_chat_id }}</strong>
+        {% if telegram_conn.username %}
+          (@{{ telegram_conn.username }})
+        {% endif %}
+      </p>
+      <p style="font-size: 0.75rem; color: var(--text-muted); margin-bottom: 1rem;">
+        Bạn có thể tra cứu CRM với lệnh <code>/crm</code> và nhận nhắc lịch họp trước 15 phút.
+      </p>
+      <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+        <form action="/connections/telegram/test" method="POST">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="btn btn-secondary">Gửi tin nhắn thử</button>
+        </form>
+        <form action="/connections/telegram/disconnect" method="POST" onsubmit="return confirm('Bạn có chắc chắn muốn ngắt kết nối Telegram? Bạn sẽ không còn nhận được thông báo nhắc họp.');">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="btn btn-danger">Ngắt kết nối</button>
+        </form>
+      </div>
+    {% else %}
+      <p style="font-size: 0.875rem; color: var(--text-muted); margin-bottom: 1rem;">
+        Liên kết Telegram riêng tư để nhận thông báo nhắc họp trước 15 phút và tra cứu CRM cá nhân.
+      </p>
+      <button id="btn-link-telegram" type="button" class="btn btn-primary">Tạo mã QR / Link</button>
+      <div id="telegram-link-box" style="display: none;"></div>
+    {% endif %}
+  </div>
+</div>
+
+<!-- 4. ĐỒNG BỘ LỊCH -->
+<div class="card">
+  <div class="card-title">
+    <span>Đồng bộ Lịch Google & Odoo</span>
+    {% if calendar_active %}
+      <span class="badge badge-success">Đang hoạt động</span>
+    {% else %}
+      <span class="badge badge-secondary">Đang tạm dừng</span>
+    {% endif %}
+  </div>
+
+  <div style="font-size: 0.875rem; margin-bottom: 1rem;">
+    <p>Phạm vi đồng bộ tự động: Từ <strong>35 ngày trước</strong> đến <strong>90 ngày sau</strong> (bao gồm lịch cá nhân và các cuộc họp bạn được mời tham gia).</p>
+    <p class="help-text" style="margin-top: 0.25rem;">
+      * Hệ thống tự động đồng bộ ngầm định kỳ mỗi 2 phút. Bạn cũng có thể bấm "Đồng bộ ngay" bất cứ lúc nào.
+    </p>
+  </div>
+
+  <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+    <form action="/calendar/sync" method="POST">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="btn btn-primary">🔄 Đồng bộ ngay</button>
+    </form>
+    {% if calendar_active %}
+      <form action="/calendar/pause" method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn btn-secondary">Tạm dừng tự động</button>
+      </form>
+    {% else %}
+      <form action="/calendar/enable" method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn btn-secondary">Bật đồng bộ lịch</button>
+      </form>
+    {% endif %}
+  </div>
+</div>
+
+<!-- 5. XUNG ĐỘT CẦN XỬ LÝ (NẾU CÓ) -->
+{% if conflicts %}
+<div class="card" style="border-left: 4px solid var(--danger);">
+  <div class="card-title" style="color: var(--danger);">
+    <span>⚠️ Xung đột lịch cần xử lý ({{ conflicts|length }})</span>
+  </div>
+  <p style="font-size: 0.875rem; color: var(--text-muted); margin-bottom: 1rem;">
+    Các lịch sau đây đã bị sửa đổi đồng thời ở cả Google Calendar và Odoo. Hãy chọn phiên bản bạn muốn giữ lại:
+  </p>
+  <div class="table-responsive">
+    <table>
+      <thead>
+        <tr>
+          <th>ID Cặp</th>
+          <th>Odoo Event ID</th>
+          <th>Google Event ID</th>
+          <th>Thao tác giải quyết</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for c in conflicts %}
+        <tr>
+          <td>#{{ c.id }}</td>
+          <td>{{ c.odoo_event_id }}</td>
+          <td><code>{{ c.google_event_id }}</code></td>
+          <td>
+            <div style="display: flex; gap: 0.5rem;">
+              <form action="/calendar/pairs/{{ c.id }}/resolve" method="POST" style="margin: 0;">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="source" value="odoo">
+                <button type="submit" class="btn btn-secondary" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Giữ bản Odoo</button>
+              </form>
+              <form action="/calendar/pairs/{{ c.id }}/resolve" method="POST" style="margin: 0;">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="source" value="google">
+                <button type="submit" class="btn btn-secondary" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Giữ bản Google</button>
+              </form>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+<!-- 6. LỊCH CHỜ ĐỐI SOÁT (AMBIGUOUS INTENTS) -->
+{% if ambiguous_intents %}
+<div class="card" style="border-left: 4px solid var(--warning);">
+  <div class="card-title" style="color: #b06000;">
+    <span>⏳ Lịch chờ đối soát ({{ ambiguous_intents|length }})</span>
+  </div>
+  <p style="font-size: 0.875rem; color: var(--text-muted); margin-bottom: 1rem;">
+    Các yêu cầu tạo lịch gặp sự cố mạng hoặc khởi động lại lúc chưa kịp nhận ID từ Odoo. Vui lòng kiểm tra trên Odoo Calendar:
+  </p>
+  <div class="table-responsive">
+    <table>
+      <thead>
+        <tr>
+          <th>ID Yêu cầu</th>
+          <th>Nội dung</th>
+          <th>Hành động</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for intent in ambiguous_intents %}
+        <tr>
+          <td>#{{ intent.id }}</td>
+          <td>Từ <strong>{{ intent.source }}</strong> &rarr; <strong>{{ intent.target }}</strong> (Event ID: <code>{{ intent.source_event_id }}</code>)</td>
+          <td>
+            <form action="/calendar/intents/{{ intent.id }}/reconcile" method="POST" style="display: flex; gap: 0.5rem; align-items: center;">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="number" name="odoo_event_id" placeholder="Nhập Odoo Event ID (nếu đã tạo)" style="width: 200px; padding: 0.35rem 0.5rem; font-size: 0.8rem;">
+              <button type="submit" name="action" value="link" class="btn btn-primary" style="padding: 0.35rem 0.6rem; font-size: 0.75rem;">Gắn kết nối</button>
+              <button type="submit" name="action" value="retry" class="btn btn-secondary" style="padding: 0.35rem 0.6rem; font-size: 0.75rem;" onclick="return confirm('Bạn chắc chắn sự kiện này chưa hề có trên Odoo?');">Thử tạo lại</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}
