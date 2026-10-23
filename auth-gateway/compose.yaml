@@ -1,0 +1,45 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: auth-gateway
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - DATABASE_URL=sqlite:////data/gateway.db
+    volumes:
+      - gateway_data:/data
+    networks:
+      - gateway_net
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: auth-gateway-tunnel
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    networks:
+      - gateway_net
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+volumes:
+  gateway_data:
+    name: auth_gateway_data
+
+networks:
+  gateway_net:
+    name: auth_gateway_net

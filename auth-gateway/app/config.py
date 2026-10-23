@@ -1,0 +1,64 @@
+from cryptography.fernet import Fernet
+from pydantic import model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    APP_ENV: str = "development"
+    PUBLIC_BASE_URL: str = "http://localhost:8080"
+    ODOO_URL: str = "https://mycompany.odoo.com"
+    ODOO_DB: str = "mycompany"
+    DATABASE_URL: str = "sqlite:///./data/gateway.db"
+    ENCRYPTION_KEY: str = ""
+
+    # Google OAuth
+    GOOGLE_CLIENT_ID: str = ""
+    GOOGLE_CLIENT_SECRET: str = ""
+    GOOGLE_WORKSPACE_DOMAINS: list[str] | str = []
+
+    # Telegram Bot
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_BOT_USERNAME: str = ""
+    TELEGRAM_WEBHOOK_SECRET: str = ""
+
+    # Optional Cloudflare
+    CLOUDFLARE_TUNNEL_TOKEN: str = ""
+
+    # Default intervals & settings
+    SESSION_LIFETIME_HOURS: int = 8
+    LINK_TOKEN_LIFETIME_MINUTES: int = 10
+    REFRESH_JOB_SECONDS: int = 60
+    CALENDAR_JOB_SECONDS: int = 120
+    REMINDER_JOB_SECONDS: int = 60
+    DEFAULT_TIMEZONE: str = "Asia/Bangkok"
+
+    @model_validator(mode="after")
+    def validate_production_constraints(self) -> "Settings":
+        if isinstance(self.GOOGLE_WORKSPACE_DOMAINS, str):
+            domains = [d.strip() for d in self.GOOGLE_WORKSPACE_DOMAINS.split(",") if d.strip()]
+            self.GOOGLE_WORKSPACE_DOMAINS = domains
+
+        if self.APP_ENV == "production":
+            # 1. ENCRYPTION_KEY must be a valid Fernet key
+            if not self.ENCRYPTION_KEY:
+                raise ValueError("ENCRYPTION_KEY is required in production")
+            try:
+                Fernet(self.ENCRYPTION_KEY.encode())
+            except Exception as e:
+                raise ValueError(f"Invalid Fernet ENCRYPTION_KEY in production: {e}") from e
+
+            # 2. PUBLIC_BASE_URL must be HTTPS
+            if not self.PUBLIC_BASE_URL.startswith("https://"):
+                raise ValueError("PUBLIC_BASE_URL must use HTTPS in production")
+
+            # 3. ODOO_URL must be HTTPS
+            if not self.ODOO_URL.startswith("https://"):
+                raise ValueError("ODOO_URL must use HTTPS in production")
+
+        return self

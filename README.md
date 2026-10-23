@@ -1,0 +1,22 @@
+# Tích hợp Odoo Online
+
+Workspace này phát triển External Auth Gateway kết nối Odoo Online với Google Workspace và Telegram. Không cần mã nguồn, addon, PostgreSQL hay môi trường Odoo local.
+
+## Bắt đầu
+
+- [Dự án gateway](auth-gateway/README.md): cài đặt và chạy gateway trên máy hoặc bằng Docker.
+- [Cấu hình tích hợp](auth-gateway/docs/SETUP.md): tenant Odoo Online, API Key cá nhân, Google OAuth và Telegram.
+- [Vận hành và sao lưu](auth-gateway/docs/OPERATIONS.md).
+- [Kết quả nghiệm thu hiện có](auth-gateway/docs/ACCEPTANCE.md): cần đối chiếu lại trước khi triển khai chính thức.
+
+Trong `auth-gateway/.env`, đặt `ODOO_URL` bằng URL HTTPS của tenant Online và `ODOO_DB` bằng tên database tương ứng. Giữ nguyên `ENCRYPTION_KEY` khi dùng dữ liệu đã có.
+
+Gateway có thể chạy trên máy của bạn; Odoo đích chạy trên Online. Docker Compose của gateway chỉ gồm gateway và Cloudflare Tunnel.
+
+## Dữ liệu cần giữ
+
+`auth-gateway/.env`, các tệp SQLite và volume `auth_gateway_data` chứa cấu hình hoặc dữ liệu vận hành. Không xóa hay đưa chúng vào Git. Hiện có database ở cả gốc gateway và `data/`; đường dẫn trong `DATABASE_URL` quyết định database được sử dụng.
+
+## Giới hạn đã biết
+
+Trước khi sử dụng với lịch thật, cần sửa logic xác minh sự kiện bị xóa và phân trang; hoàn thiện xử lý xung đột, đối soát, bật/tạm dừng đồng bộ, giới hạn đăng nhập và bảo vệ CSRF. Bộ kiểm thử hiện có chưa bao phủ đủ các tình huống này.
