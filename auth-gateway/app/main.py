@@ -168,6 +168,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     from app.auth.routes import router as auth_router
     from app.google.routes import router as google_router
+    from app.internal.routes import router as internal_router
     from app.portal.routes import router as portal_router
     from app.telegram.routes import router as telegram_router
 
@@ -179,6 +180,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(auth_router)
     app.include_router(google_router)
     app.include_router(telegram_router)
+    app.include_router(internal_router)
 
     return app
 

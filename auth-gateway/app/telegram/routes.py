@@ -41,6 +41,9 @@ def get_telegram_service(
         odoo_client=odoo_client,
         encryption_key=settings.ENCRYPTION_KEY or "dev_dummy_key_000000000000000000000=",
         odoo_base_url=settings.ODOO_URL,
+        enable_ai_forwarding=settings.ENABLE_AI_AGENT_FORWARDING,
+        ai_agent_base_url=settings.AI_AGENT_BASE_URL,
+        gateway_to_agent_secret=settings.GATEWAY_TO_AGENT_SECRET,
     )
 
 

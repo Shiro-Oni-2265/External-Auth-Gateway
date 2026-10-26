@@ -34,7 +34,13 @@ class TelegramService:
         odoo_client: OdooClient | None = None,
         encryption_key: str = "",
         odoo_base_url: str = "",
+        enable_ai_forwarding: bool = False,
+        ai_agent_base_url: str = "http://localhost:8000",
+        gateway_to_agent_secret: str = "",
     ):
+        self.enable_ai_forwarding = enable_ai_forwarding
+        self.ai_agent_base_url = ai_agent_base_url.rstrip("/")
+        self.gateway_to_agent_secret = gateway_to_agent_secret
         self.session_factory = session_factory
         self.telegram_client = telegram_client
         self.bot_username = bot_username.lstrip("@").strip()
@@ -122,6 +128,8 @@ class TelegramService:
             parts = text.split(maxsplit=1)
             search_query = parts[1].strip() if len(parts) > 1 else None
             self._handle_crm(chat_id, telegram_user_id, search_query)
+        else:
+            self._handle_ai_turn(update, chat_id, telegram_user_id, username, text)
 
     def _handle_pairing(
         self,
@@ -411,3 +419,225 @@ class TelegramService:
 
     # Alias for flexibility
     process_update_payload = process_update_dict
+
+    def _split_text(self, text: str, max_length: int = 4000) -> list[str]:
+        if len(text) <= max_length:
+            return [text]
+        chunks: list[str] = []
+        lines = text.split("\n")
+        current = ""
+        for line in lines:
+            if len(current) + len(line) + 1 > max_length:
+                if current:
+                    chunks.append(current.strip())
+                    current = ""
+                if len(line) > max_length:
+                    for i in range(0, len(line), max_length):
+                        chunks.append(line[i : i + max_length])
+                else:
+                    current = line
+            else:
+                current = (current + "\n" + line) if current else line
+        if current:
+            chunks.append(current.strip())
+        return chunks
+
+    def _safe_send_message(self, chat_id: int, text: str) -> None:
+        chunks = self._split_text(text)
+        for chunk in chunks:
+            try:
+                self.telegram_client.send_message(chat_id, chunk, parse_mode="Markdown")
+            except Exception:
+                try:
+                    self.telegram_client.send_message(chat_id, chunk, parse_mode="")
+                except Exception as e:
+                    _logger.warning("Failed to send telegram message chunk: %s", e)
+                    raise
+
+    def _handle_ai_turn(
+        self,
+        update: dict[str, Any],
+        chat_id: int,
+        telegram_user_id: int,
+        username: str | None,
+        text: str,
+    ) -> None:
+        update_id = update.get("update_id")
+
+        # 1. Resolve identity
+        with self.session_factory() as db:
+            conn = (
+                db.query(TelegramConnection)
+                .filter_by(
+                    telegram_user_id=telegram_user_id,
+                    private_chat_id=chat_id,
+                    status="connected",
+                )
+                .first()
+            )
+            if not conn:
+                self.telegram_client.send_message(
+                    chat_id,
+                    "👋 Xin chào! Tài khoản Telegram của bạn chưa được liên kết với Odoo.\n"
+                    "Vui lòng đăng nhập vào Cổng Portal trên trình duyệt và bấm <b>'Liên kết Telegram'</b> để bắt đầu sử dụng.",
+                )
+                return
+
+            user = db.query(User).filter_by(id=conn.user_id).first()
+            if not user or not user.active:
+                self.telegram_client.send_message(
+                    chat_id,
+                    "⚠️ Tài khoản người dùng của bạn hiện đang bị vô hiệu hóa. Vui lòng liên hệ quản trị viên.",
+                )
+                return
+
+            user_id = user.id
+
+        # 2. Check AI forwarding toggle
+        if not self.enable_ai_forwarding:
+            self.telegram_client.send_message(
+                chat_id,
+                "ℹ️ Tính năng AI Agent hiện đang tạm dừng kết nối. Vui lòng thử lại sau hoặc sử dụng các lệnh /crm, /status.",
+            )
+            return
+
+        # 3. Check TelegramUpdate record for idempotency and resume
+        messages_to_send: list[str] = []
+        with self.session_factory() as db:
+            import json
+
+            from app.models import TelegramUpdate
+
+            up_record = None
+            if update_id:
+                up_record = db.query(TelegramUpdate).filter_by(update_id=update_id).first()
+                if up_record:
+                    if up_record.status == "processed":
+                        return
+                    if up_record.delivery_status == "delivery_unknown":
+                        _logger.warning(
+                            "Update %s has unknown delivery status. Avoiding duplicate resend.",
+                            update_id,
+                        )
+                        return
+                    if up_record.status == "ai_received" and up_record.ai_response:
+                        try:
+                            messages_to_send = json.loads(up_record.ai_response)
+                        except Exception:
+                            pass
+
+        # 4. If AI messages not yet fetched, call AI Agent
+        if not messages_to_send:
+            if update_id:
+                with self.session_factory() as db:
+                    from app.models import TelegramUpdate
+
+                    # Conditional lock / update
+                    db.query(TelegramUpdate).filter_by(update_id=update_id).update(
+                        {"status": "processing_ai"}
+                    )
+                    db.commit()
+
+            ai_url = f"{self.ai_agent_base_url}/internal/v1/telegram/turn"
+            headers = {
+                "Authorization": f"Bearer {self.gateway_to_agent_secret}",
+                "Content-Type": "application/json",
+            }
+            req_payload = {
+                "request_id": f"tg-{update_id or telegram_user_id}",
+                "gateway_user_id": user_id,
+                "telegram_user_id": telegram_user_id,
+                "chat_id": chat_id,
+                "text": text,
+                "received_at": datetime.now(UTC).isoformat(),
+            }
+
+            import httpx
+
+            try:
+                resp = httpx.post(ai_url, json=req_payload, headers=headers, timeout=25.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    messages_to_send = data.get("messages", [])
+                else:
+                    _logger.error("AI Agent returned %s: %s", resp.status_code, resp.text)
+                    self.telegram_client.send_message(
+                        chat_id,
+                        "⚠️ AI Agent hiện không thể xử lý yêu cầu. Vui lòng thử lại sau.",
+                    )
+                    if update_id:
+                        with self.session_factory() as db:
+                            from app.models import TelegramUpdate
+
+                            db.query(TelegramUpdate).filter_by(update_id=update_id).update(
+                                {"status": "failed"}
+                            )
+                            db.commit()
+                    return
+            except Exception as e:
+                _logger.error("Error connecting to AI Agent: %s", e)
+                self.telegram_client.send_message(
+                    chat_id,
+                    "⚠️ Không thể kết nối đến AI Agent (Lỗi kết nối hoặc hết thời gian chờ).",
+                )
+                if update_id:
+                    with self.session_factory() as db:
+                        from app.models import TelegramUpdate
+
+                        db.query(TelegramUpdate).filter_by(update_id=update_id).update(
+                            {"status": "failed"}
+                        )
+                        db.commit()
+                return
+
+            if update_id and messages_to_send:
+                with self.session_factory() as db:
+                    import json
+
+                    from app.models import TelegramUpdate
+
+                    db.query(TelegramUpdate).filter_by(update_id=update_id).update(
+                        {
+                            "ai_response": json.dumps(messages_to_send, ensure_ascii=False),
+                            "status": "ai_received",
+                        }
+                    )
+                    db.commit()
+
+        # 5. Deliver messages to Telegram
+        if update_id:
+            with self.session_factory() as db:
+                from app.models import TelegramUpdate
+
+                db.query(TelegramUpdate).filter_by(update_id=update_id).update(
+                    {"delivery_status": "sending"}
+                )
+                db.commit()
+
+        try:
+            for msg in messages_to_send:
+                self._safe_send_message(chat_id, msg)
+            if update_id:
+                with self.session_factory() as db:
+                    from app.models import TelegramUpdate
+
+                    db.query(TelegramUpdate).filter_by(update_id=update_id).update(
+                        {
+                            "delivery_status": "delivered",
+                            "status": "processed",
+                        }
+                    )
+                    db.commit()
+        except Exception as e:
+            _logger.error("Failed to deliver message to Telegram chat %s: %s", chat_id, e)
+            if update_id:
+                with self.session_factory() as db:
+                    from app.models import TelegramUpdate
+
+                    db.query(TelegramUpdate).filter_by(update_id=update_id).update(
+                        {
+                            "delivery_status": "delivery_unknown",
+                            "status": "failed",
+                        }
+                    )
+                    db.commit()

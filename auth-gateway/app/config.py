@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_USERNAME: str = ""
     TELEGRAM_WEBHOOK_SECRET: str = ""
 
+    # AI Agent Integration
+    ENABLE_AI_AGENT_FORWARDING: bool = False
+    AI_AGENT_BASE_URL: str = "http://localhost:8000"
+    GATEWAY_TO_AGENT_SECRET: str = ""
+    AGENT_TO_GATEWAY_SECRET: str = ""
+
     # Optional Cloudflare
     CLOUDFLARE_TUNNEL_TOKEN: str = ""
 

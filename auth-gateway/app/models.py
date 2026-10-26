@@ -195,8 +195,12 @@ class TelegramUpdate(Base):
     payload = Column(Text, nullable=False)
     status = Column(
         String(32), default="pending", nullable=False
-    )  # 'pending', 'processed', 'failed'
+    )  # 'pending', 'processing_ai', 'ai_received', 'processed', 'failed'
     attempts = Column(Integer, default=0, nullable=False)
+    ai_response = Column(Text, nullable=True)
+    delivery_status = Column(
+        String(32), default="none", nullable=False
+    )  # 'none', 'sending', 'delivered', 'delivery_unknown', 'failed'
     created_at = Column(DateTime, default=utc_now, nullable=False)
 
 

@@ -48,6 +48,7 @@ class GoogleOAuthService:
         "openid",
         "email",
         "https://www.googleapis.com/auth/calendar.events",
+        "https://www.googleapis.com/auth/gmail.readonly",
     ]
 
     def __init__(

@@ -37,6 +37,25 @@ def create_sqlite_engine(db_url: str) -> Engine:
 def init_db(db_url: str) -> tuple[Engine, sessionmaker]:
     engine = create_sqlite_engine(db_url)
     Base.metadata.create_all(bind=engine)
+    # Migration check for TelegramUpdate
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        try:
+            res = conn.execute(text("PRAGMA table_info(telegram_updates)"))
+            cols = [r[1] for r in res.fetchall()]
+            if cols and "ai_response" not in cols:
+                conn.execute(text("ALTER TABLE telegram_updates ADD COLUMN ai_response TEXT"))
+            if cols and "delivery_status" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE telegram_updates ADD COLUMN delivery_status VARCHAR(32) DEFAULT 'none' NOT NULL"
+                    )
+                )
+            conn.commit()
+        except Exception:
+            pass
+
     session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     return engine, session_factory
 
