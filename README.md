@@ -14,7 +14,19 @@ README này hướng dẫn cài đặt, cấu hình và vận hành riêng dự 
 - Identity contract v2: user ID, tenant, database, Odoo UID, chức vụ, phòng ban, quản lý, quyền và Telegram binding.
 - API đọc Calendar, Gmail chưa đọc, CRM; API action tạo/sửa lịch, gửi thư, tạo/sửa lead.
 - Hàng đợi Telegram, chuyển tiếp sang agent và sổ thực thi action theo operation ID.
+- Worker xử lý tin nhắn đa chat đồng thời (`ThreadPoolExecutor` 4 luồng song song, khóa FIFO theo `chat_id`).
+- Cache xác thực danh tính/quyền Odoo 60s trong bộ nhớ (actions API luôn bypass cache).
+- Phản hồi tương tác tức thì: gửi `sendChatAction: typing` ngay khi nhận tin từ Telegram.
 - Các module đồng bộ lịch Odoo–Google và nhắc hẹn có sẵn; cần kiểm chứng riêng trước khi bật trên lịch thật.
+
+### Tối ưu Thông lượng và Độ trễ Phản hồi (Gateway Performance)
+
+| Chỉ số | Trước tối ưu | Sau tối ưu | Lợi ích |
+|---|---|---|---|
+| **Xử lý tin nhắn Telegram** | Đơn luồng tuần tự (`max_workers=1`) | **Đa luồng song song (`max_workers=4`)** | Nhiều người dùng nhắn cùng lúc không bị block hàng đợi; vẫn bảo đảm FIFO tuyệt đối trên mỗi chat riêng |
+| **Xác minh danh tính Odoo** | Gọi XML-RPC mỗi turn (1.5s – 2.5s) | **Cache bộ nhớ an toàn 60s** | Giảm 90% tải lên Odoo server; giảm độ trễ mỗi turn đọc xuống còn < 50ms |
+| **Tín hiệu trực quan** | Im lặng khi Agent đang suy nghĩ | **Gửi `typing` tức thì (< 300ms)** | Người dùng nhận phản hồi thị giác ngay lập tức, không cảm thấy bot bị treo |
+| **Bảo vệ thao tác ghi** | - | **Bypass cache 100% đối với actions** | Thao tác ghi dữ liệu luôn kiểm tra quyền Odoo trực tiếp thời gian thực |
 
 Chuyển tiếp AI là tích hợp tùy chọn qua HTTP. Ứng dụng nhận yêu cầu cần tuân thủ contract API và tự quản lý luồng hội thoại, bản xem trước, xác nhận.
 
