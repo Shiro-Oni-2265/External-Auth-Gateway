@@ -1,9 +1,10 @@
 import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
-from cryptography.fernet import Fernet
-from fastapi import HTTPException, status
+
 import pytest
+from cryptography.fernet import Fernet
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.config import Settings
