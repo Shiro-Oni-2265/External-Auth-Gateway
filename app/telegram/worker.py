@@ -2,7 +2,6 @@ import json
 import logging
 import secrets
 import threading
-import time
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -874,11 +873,15 @@ class TelegramAIWorker:
         def _worker_loop():
             _logger.info("TelegramAIWorker started.")
             while not self._stop_event.is_set():
+                processed = 0
                 try:
-                    self.process_pending_once()
+                    processed = self.process_pending_once()
                 except Exception as e:
                     _logger.error("Error in TelegramAIWorker loop: %s", e)
-                time.sleep(1.0)
+                if processed > 0:
+                    self._stop_event.wait(0.02)
+                else:
+                    self._stop_event.wait(0.2)
             _logger.info("TelegramAIWorker stopped.")
 
         self._thread = threading.Thread(target=_worker_loop, daemon=True, name="TelegramAIWorker")
