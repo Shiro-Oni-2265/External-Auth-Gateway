@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from app.google.client import GoogleClient
 from app.google.oauth import GoogleOAuthService
+from app.internal.cache import identity_cache
 from app.internal.security import verify_agent_secret
 from app.models import ActionOperation, TelegramConnection, User
 from app.odoo.client import (
@@ -154,30 +155,53 @@ def resolve_identity(
                 except Exception:
                     secret = ""
 
-            odoo_svc = _get_odoo_service(request, user)
-            # Xác minh Odoo account trước khi cấp quyền
-            _verify_odoo_account(odoo_svc, user.odoo_uid, secret)
-
-            job_title = None
-            department = None
-            manager_name = None
-            if odoo_svc and secret:
-                profile = odoo_svc.get_employee_profile(user.odoo_uid, secret)
-                job_title = profile.get("job_title")
-                department = profile.get("department")
-                manager_name = profile.get("manager_name")
-
             g_conn = user.google_connection
             g_status = g_conn.status if g_conn else "disconnected"
             g_scopes = g_conn.scopes.split() if g_conn and g_conn.scopes else []
 
-            permissions = odoo_svc.compute_permissions(
-                uid=user.odoo_uid,
-                secret=secret,
-                is_internal_user=bool(user.active),
-                google_status=g_status,
-                google_scopes=g_scopes,
-            )
+            secret_hash = hashlib.sha256(secret.encode()).hexdigest()
+            scopes_key = ",".join(sorted(g_scopes))
+            cache_key = f"{user.id}:{user.tenant}:{user.database}:{user.odoo_uid}:{secret_hash}:{g_status}:{scopes_key}"
+
+            cached = identity_cache.get(cache_key)
+            if cached:
+                job_title = cached.get("job_title")
+                department = cached.get("department")
+                manager_name = cached.get("manager_name")
+                permissions = cached.get("permissions", [])
+                auth_checked_at = cached.get("authorization_checked_at") or datetime.now(UTC).isoformat()
+            else:
+                odoo_svc = _get_odoo_service(request, user)
+                # Xác minh Odoo account trước khi cấp quyền
+                _verify_odoo_account(odoo_svc, user.odoo_uid, secret)
+
+                job_title = None
+                department = None
+                manager_name = None
+                if odoo_svc and secret:
+                    profile = odoo_svc.get_employee_profile(user.odoo_uid, secret)
+                    job_title = profile.get("job_title")
+                    department = profile.get("department")
+                    manager_name = profile.get("manager_name")
+
+                permissions = odoo_svc.compute_permissions(
+                    uid=user.odoo_uid,
+                    secret=secret,
+                    is_internal_user=bool(user.active),
+                    google_status=g_status,
+                    google_scopes=g_scopes,
+                )
+                auth_checked_at = datetime.now(UTC).isoformat()
+                identity_cache.set(
+                    cache_key,
+                    {
+                        "job_title": job_title,
+                        "department": department,
+                        "manager_name": manager_name,
+                        "permissions": permissions,
+                        "authorization_checked_at": auth_checked_at,
+                    },
+                )
 
             return {
                 "contract_version": 2,
@@ -194,7 +218,7 @@ def resolve_identity(
                 "department": department,
                 "manager_name": manager_name,
                 "permissions": permissions,
-                "authorization_checked_at": datetime.now(UTC).isoformat(),
+                "authorization_checked_at": auth_checked_at,
             }
 
         return {
