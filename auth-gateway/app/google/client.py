@@ -96,7 +96,7 @@ class GoogleClient:
         headers = {}
         if etag:
             headers["If-Match"] = etag
-        resp = self._request(user_id, "PUT", url, json_data=event_data, headers=headers)
+        resp = self._request(user_id, "PATCH", url, json_data=event_data, headers=headers)
         resp.raise_for_status()
         return resp.json()
 
@@ -152,3 +152,135 @@ class GoogleClient:
         resp = self._request(user_id, "POST", url, json_data={"values": [values]})
         resp.raise_for_status()
         return resp.json()
+
+    # --- Gmail API ---
+    def get_user_google_connection(self, user_id: int):
+        from app.models import GoogleConnection
+
+        with self.oauth_service.session_factory() as db:
+            return db.query(GoogleConnection).filter_by(user_id=user_id).first()
+
+    def check_has_scope(self, user_id: int, scope_fragment: str) -> bool:
+        conn = self.get_user_google_connection(user_id)
+        if not conn or not conn.scopes:
+            return False
+        return any(scope_fragment in s for s in conn.scopes.split())
+
+    def list_unread_emails(self, user_id: int, max_results: int = 5) -> dict[str, Any]:
+        """Fetch unread emails for user. Checks scope, status, and handles errors."""
+        conn = self.get_user_google_connection(user_id)
+        if not conn or conn.status == "disconnected":
+            return {"status": "NOT_CONNECTED", "total_unread": 0, "messages": []}
+        if conn.status == "reconnect_required":
+            return {"status": "RECONNECT_REQUIRED", "total_unread": 0, "messages": []}
+
+        # Check actual granted scope
+        if not self.check_has_scope(user_id, "gmail.readonly"):
+            return {
+                "status": "PERMISSION_DENIED",
+                "total_unread": 0,
+                "messages": [],
+                "instruction": "Vui lòng cấp thêm quyền đọc Gmail qua Cổng Portal.",
+            }
+
+        gmail_base = "https://gmail.googleapis.com/gmail/v1/users/me"
+        try:
+            # 1. Get messages
+            resp = self._request(
+                user_id,
+                "GET",
+                f"{gmail_base}/messages",
+                params={"q": "in:inbox is:unread", "maxResults": max_results},
+            )
+            if resp.status_code == 403:
+                return {
+                    "status": "PERMISSION_DENIED",
+                    "total_unread": 0,
+                    "messages": [],
+                    "instruction": "Vui lòng cấp thêm quyền đọc Gmail qua Cổng Portal.",
+                }
+            resp.raise_for_status()
+            data = resp.json()
+
+            msg_items = data.get("messages", [])
+
+            # Accurate unread count strictly from INBOX label
+            accurate_total = None
+            try:
+                lbl_resp = self._request(user_id, "GET", f"{gmail_base}/labels/INBOX")
+                if lbl_resp.status_code == 200:
+                    lbl_data = lbl_resp.json()
+                    accurate_total = lbl_data.get("messagesUnread")
+            except Exception:
+                pass
+
+            messages = []
+            for item in msg_items[:max_results]:
+                msg_id = item["id"]
+                try:
+                    detail_resp = self._request(
+                        user_id,
+                        "GET",
+                        f"{gmail_base}/messages/{msg_id}",
+                        params={
+                            "format": "metadata",
+                            "metadataHeaders": ["From", "Subject", "Date"],
+                        },
+                    )
+                    if detail_resp.status_code == 200:
+                        m_data = detail_resp.json()
+                        headers = {
+                            h.get("name", "").lower(): h.get("value", "")
+                            for h in m_data.get("payload", {}).get("headers", [])
+                        }
+                        messages.append(
+                            {
+                                "id": msg_id,
+                                "from": headers.get("from", "Không rõ người gửi"),
+                                "subject": headers.get("subject", "Không có tiêu đề"),
+                                "date": headers.get("date", ""),
+                                "link": f"https://mail.google.com/mail/u/0/#inbox/{msg_id}",
+                            }
+                        )
+                except Exception:
+                    continue
+
+            return {
+                "status": "OK",
+                "total_unread": accurate_total,
+                "messages": messages,
+            }
+        except Exception as e:
+            from app.google.oauth import GoogleAuthRevokedError
+
+            if isinstance(e, GoogleAuthRevokedError):
+                return {"status": "RECONNECT_REQUIRED", "total_unread": 0, "messages": []}
+            return {"status": "ERROR", "total_unread": 0, "messages": [], "message": str(e)}
+
+    def send_email(
+        self,
+        user_id: int,
+        to: list[str] | str,
+        subject: str,
+        body_text: str,
+    ) -> dict[str, Any]:
+        """Gửi email qua Gmail API dưới tài khoản Google đã liên kết của người dùng."""
+        import base64
+        from email.mime.text import MIMEText
+
+        to_str = ", ".join(to) if isinstance(to, list) else to
+        msg = MIMEText(body_text, _charset="utf-8")
+        msg["To"] = to_str
+        msg["Subject"] = subject
+
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+        url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
+        resp = self._request(user_id, "POST", url, json_data={"raw": raw})
+        if resp.status_code == 403:
+            return {
+                "status": "PERMISSION_DENIED",
+                "message": "Chưa được cấp quyền gửi Gmail (cần scope gmail.send). Vui lòng mở Portal để cấp thêm quyền.",
+            }
+        resp.raise_for_status()
+        data = resp.json()
+        return {"status": "OK", "id": data.get("id"), "thread_id": data.get("threadId")}

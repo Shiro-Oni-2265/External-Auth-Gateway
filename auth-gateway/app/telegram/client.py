@@ -10,6 +10,10 @@ class TelegramError(Exception):
     pass
 
 
+class TelegramDeliveryUnknownError(TelegramError):
+    pass
+
+
 class BotBlockedError(TelegramError):
     pass
 
@@ -69,4 +73,4 @@ class TelegramClient:
 
             return data.get("result", {})
         except (httpx.TimeoutException, httpx.NetworkError) as e:
-            raise TelegramError(f"Network error connecting to Telegram: {e}") from e
+            raise TelegramDeliveryUnknownError(f"Network error connecting to Telegram: {e}") from e

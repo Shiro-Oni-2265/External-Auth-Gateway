@@ -28,6 +28,18 @@ class OdooNetworkError(OdooError):
     pass
 
 
+class OdooAccountInactiveError(OdooAccessError):
+    """Raised when Odoo account is inactive (active=False)."""
+
+    pass
+
+
+class OdooExternalUserError(OdooAccessError):
+    """Raised when Odoo account is an external/portal user (share=True)."""
+
+    pass
+
+
 class TimeoutTransport(xmlrpc.client.SafeTransport):
     """XML-RPC transport with configurable timeout and TLS context."""
 

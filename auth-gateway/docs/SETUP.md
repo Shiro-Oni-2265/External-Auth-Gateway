@@ -47,7 +47,7 @@ Hệ thống kết nối trực tiếp qua chuẩn XML-RPC của Odoo (`common` 
 4. Lưu lại:
    - `Client ID` &rarr; gán vào biến môi trường `GOOGLE_CLIENT_ID`.
    - `Client Secret` &rarr; gán vào biến môi trường `GOOGLE_CLIENT_SECRET`.
-5. Đặt danh sách domain được phép trong `GOOGLE_WORKSPACE_DOMAINS` (ví dụ: `company.com`).
+5. Cấu hình domain Google: Để trống biến `GOOGLE_WORKSPACE_DOMAINS` để cho phép mọi tài khoản Google (bao gồm Gmail cá nhân). Nếu cần giới hạn theo doanh nghiệp, điền danh sách domain cách nhau bằng dấu phẩy (ví dụ: `company.com`).
 
 ---
 

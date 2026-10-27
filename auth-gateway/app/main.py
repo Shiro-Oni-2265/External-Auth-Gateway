@@ -22,6 +22,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.session_factory = session_factory
 
         scheduler = None
+        ai_worker = None
         poller_stop_event = None
         if settings.APP_ENV != "test":
             from app.calendar.reminders import ReminderService
@@ -72,6 +73,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 reminder_interval=settings.REMINDER_JOB_SECONDS,
             )
             scheduler.start()
+            if settings.ENABLE_AI_AGENT_FORWARDING:
+                from app.telegram.worker import TelegramAIWorker
+
+                ai_worker = TelegramAIWorker(
+                    settings=settings,
+                    session_factory=session_factory,
+                    telegram_client=tele_client,
+                )
+                ai_worker.start()
 
             # Automatic Telegram poller for development mode
             poller_stop_event = None
@@ -85,17 +95,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
                 import httpx
 
-                from app.telegram.service import TelegramService
-
                 poller_stop_event = threading.Event()
-                tele_svc = TelegramService(
+                from app.telegram.service import create_telegram_service
+
+                tele_svc = create_telegram_service(
+                    settings=settings,
                     session_factory=session_factory,
                     telegram_client=tele_client,
-                    bot_username=settings.TELEGRAM_BOT_USERNAME,
-                    webhook_secret=settings.TELEGRAM_WEBHOOK_SECRET,
                     odoo_client=odoo_client,
-                    encryption_key=settings.ENCRYPTION_KEY or "",
-                    odoo_base_url=settings.ODOO_URL,
                 )
 
                 def _poll_worker():
@@ -113,8 +120,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                 data = resp.json()
                                 if data.get("ok"):
                                     for up in data.get("result", []):
+                                        tele_svc.ingest_update(up)
                                         offset = up["update_id"] + 1
-                                        tele_svc.process_update_dict(up)
                         except Exception:
                             pass
                         time.sleep(1)
@@ -128,6 +135,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         if poller_stop_event:
             poller_stop_event.set()
+        if ai_worker:
+            ai_worker.stop()
         if scheduler:
             scheduler.stop()
         engine.dispose()
@@ -168,6 +177,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     from app.auth.routes import router as auth_router
     from app.google.routes import router as google_router
+    from app.internal.routes import router as internal_router
     from app.portal.routes import router as portal_router
     from app.telegram.routes import router as telegram_router
 
@@ -179,6 +189,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(auth_router)
     app.include_router(google_router)
     app.include_router(telegram_router)
+    app.include_router(internal_router)
 
     return app
 

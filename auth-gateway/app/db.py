@@ -37,6 +37,76 @@ def create_sqlite_engine(db_url: str) -> Engine:
 def init_db(db_url: str) -> tuple[Engine, sessionmaker]:
     engine = create_sqlite_engine(db_url)
     Base.metadata.create_all(bind=engine)
+    # Migration check for TelegramUpdate
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        try:
+            res = conn.execute(text("PRAGMA table_info(telegram_updates)"))
+            cols = [r[1] for r in res.fetchall()]
+            if cols:
+                if "ai_response" not in cols:
+                    conn.execute(text("ALTER TABLE telegram_updates ADD COLUMN ai_response TEXT"))
+                if "delivery_status" not in cols:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE telegram_updates ADD COLUMN delivery_status VARCHAR(32) DEFAULT 'none' NOT NULL"
+                        )
+                    )
+                if "delivery_chunks" not in cols:
+                    conn.execute(
+                        text("ALTER TABLE telegram_updates ADD COLUMN delivery_chunks TEXT")
+                    )
+                if "delivery_index" not in cols:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE telegram_updates ADD COLUMN delivery_index INTEGER DEFAULT 0 NOT NULL"
+                        )
+                    )
+                if "lease_expires_at" not in cols:
+                    conn.execute(
+                        text("ALTER TABLE telegram_updates ADD COLUMN lease_expires_at DATETIME")
+                    )
+                if "retry_at" not in cols:
+                    conn.execute(text("ALTER TABLE telegram_updates ADD COLUMN retry_at DATETIME"))
+                if "last_error" not in cols:
+                    conn.execute(text("ALTER TABLE telegram_updates ADD COLUMN last_error TEXT"))
+                if "claim_token" not in cols:
+                    conn.execute(
+                        text("ALTER TABLE telegram_updates ADD COLUMN claim_token VARCHAR(64)")
+                    )
+                if "user_id" not in cols:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE telegram_updates ADD COLUMN user_id INTEGER REFERENCES users(id)"
+                        )
+                    )
+                if "updated_at" not in cols:
+                    conn.execute(
+                        text("ALTER TABLE telegram_updates ADD COLUMN updated_at DATETIME")
+                    )
+            conn.commit()
+        except Exception:
+            pass
+
+        try:
+            import secrets
+            res = conn.execute(text("PRAGMA table_info(telegram_connections)"))
+            cols = [r[1] for r in res.fetchall()]
+            if cols:
+                if "binding_id" not in cols:
+                    conn.execute(text("ALTER TABLE telegram_connections ADD COLUMN binding_id VARCHAR(64)"))
+                res_null = conn.execute(text("SELECT id FROM telegram_connections WHERE binding_id IS NULL"))
+                for row in res_null.fetchall():
+                    new_bid = f"tg_bind_{secrets.token_hex(16)}"
+                    conn.execute(
+                        text("UPDATE telegram_connections SET binding_id = :bid WHERE id = :cid"),
+                        {"bid": new_bid, "cid": row[0]},
+                    )
+            conn.commit()
+        except Exception:
+            pass
+
     session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     return engine, session_factory
 

@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_USERNAME: str = ""
     TELEGRAM_WEBHOOK_SECRET: str = ""
 
+    # AI Agent Integration
+    ENABLE_AI_AGENT_FORWARDING: bool = False
+    AI_AGENT_BASE_URL: str = "http://localhost:8000"
+    GATEWAY_TO_AGENT_SECRET: str = ""
+    AGENT_TO_GATEWAY_SECRET: str = ""
+
     # Optional Cloudflare
     CLOUDFLARE_TUNNEL_TOKEN: str = ""
 
@@ -43,6 +49,18 @@ class Settings(BaseSettings):
         if isinstance(self.GOOGLE_WORKSPACE_DOMAINS, str):
             domains = [d.strip() for d in self.GOOGLE_WORKSPACE_DOMAINS.split(",") if d.strip()]
             self.GOOGLE_WORKSPACE_DOMAINS = domains
+
+        if self.ENABLE_AI_AGENT_FORWARDING:
+            if not self.GATEWAY_TO_AGENT_SECRET or not self.AGENT_TO_GATEWAY_SECRET:
+                raise ValueError(
+                    "GATEWAY_TO_AGENT_SECRET and AGENT_TO_GATEWAY_SECRET are required when ENABLE_AI_AGENT_FORWARDING is True."
+                )
+            if len(self.GATEWAY_TO_AGENT_SECRET) < 32 or len(self.AGENT_TO_GATEWAY_SECRET) < 32:
+                raise ValueError("Both service secrets must be at least 32 characters long.")
+            if self.GATEWAY_TO_AGENT_SECRET == self.AGENT_TO_GATEWAY_SECRET:
+                raise ValueError(
+                    "GATEWAY_TO_AGENT_SECRET and AGENT_TO_GATEWAY_SECRET must be different/distinct."
+                )
 
         if self.APP_ENV == "production":
             # 1. ENCRYPTION_KEY must be a valid Fernet key

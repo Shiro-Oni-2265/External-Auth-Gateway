@@ -127,6 +127,7 @@ class TelegramConnection(Base):
     telegram_user_id = Column(BigInteger, unique=True, index=True, nullable=False)
     private_chat_id = Column(BigInteger, unique=True, index=True, nullable=False)
     username = Column(String(255), nullable=True)
+    binding_id = Column(String(64), nullable=True, index=True)
     status = Column(
         String(32), default="connected", nullable=False
     )  # 'connected', 'blocked', 'disconnected'
@@ -193,11 +194,25 @@ class TelegramUpdate(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     update_id = Column(BigInteger, unique=True, index=True, nullable=False)
     payload = Column(Text, nullable=False)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    claim_token = Column(String(64), nullable=True, index=True)
     status = Column(
-        String(32), default="pending", nullable=False
-    )  # 'pending', 'processed', 'failed'
+        String(32), default="pending", nullable=False, index=True
+    )  # 'pending', 'processing_ai', 'ai_received', 'retry_wait', 'processed', 'failed'
     attempts = Column(Integer, default=0, nullable=False)
+    ai_response = Column(Text, nullable=True)
+    delivery_status = Column(
+        String(32), default="none", nullable=False
+    )  # 'none', 'sending', 'delivered', 'delivery_unknown', 'failed'
+    delivery_chunks = Column(Text, nullable=True)
+    delivery_index = Column(Integer, default=0, nullable=False)
+    lease_expires_at = Column(DateTime, nullable=True)
+    retry_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
     created_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
 
 class Outbox(Base):
@@ -226,3 +241,24 @@ class JobRun(Base):
     last_success_at = Column(DateTime, nullable=True)
     last_error_code = Column(String(64), nullable=True)
     next_attempt_at = Column(DateTime, nullable=True)
+
+
+class ActionOperation(Base):
+    __tablename__ = "action_operations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    operation_id = Column(String(64), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    action = Column(String(64), nullable=False)
+    payload_hash = Column(String(64), nullable=False)
+    status = Column(
+        String(32), default="in_progress", nullable=False
+    )  # 'in_progress', 'completed', 'unknown_result', 'failed'
+    result_json = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "operation_id", name="uq_action_operation_user"),
+    )
