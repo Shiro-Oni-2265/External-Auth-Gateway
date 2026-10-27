@@ -866,6 +866,55 @@ def get_user_action_status(
                 detail={"code": "BINDING_MISMATCH", "message": "Operation belongs to another binding"},
             )
 
+        # Xác minh tài khoản Odoo và quyền action hiện tại giống logic của POST
+        settings = getattr(request.app.state, "settings", None)
+        if not settings:
+            from app.config import get_settings
+            settings = get_settings()
+
+        secret = ""
+        if user.credential and user.credential.encrypted_secret and settings.ENCRYPTION_KEY:
+            try:
+                secret = decrypt_secret(user.credential.encrypted_secret, settings.ENCRYPTION_KEY)
+            except Exception:
+                secret = ""
+
+        odoo_svc = _get_odoo_service(request, user)
+        # _verify_odoo_account kiểm tra secret và trạng thái Odoo; ném 403 hoặc 503
+        _verify_odoo_account(odoo_svc, user.odoo_uid, secret)
+
+        if op.action:
+            action_perm_map = {
+                "calendar.create": "calendar.write",
+                "calendar.update": "calendar.write",
+                "gmail.send": "gmail.send",
+                "crm.create": "crm.create",
+                "crm.update": "crm.write",
+            }
+            if op.action in action_perm_map:
+                needed_perm = action_perm_map[op.action]
+                g_conn = user.google_connection
+                g_status = g_conn.status if g_conn else "disconnected"
+                g_scopes = g_conn.scopes.split() if g_conn and g_conn.scopes else []
+
+                permissions = set(
+                    odoo_svc.compute_permissions(
+                        uid=user.odoo_uid,
+                        secret=secret,
+                        is_internal_user=bool(user.active),
+                        google_status=g_status,
+                        google_scopes=g_scopes,
+                    )
+                )
+                if needed_perm not in permissions:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail={
+                            "code": "PERMISSION_DENIED",
+                            "message": f"Tài khoản hiện không có quyền cho action '{op.action}' (yêu cầu {needed_perm}).",
+                        },
+                    )
+
         # Trích xuất result nếu có
         res_data = None
         if op.status == "completed" and op.result_json:
