@@ -1,33 +1,34 @@
-# Secrets and local configuration
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Environment files with secrets
 .env
 *.env
 !.env.example
 
-# Local databases and runtime data
+# SQLite Database & Storage
+data/
 *.db
-*.db-shm
-*.db-wal
 *.sqlite
 *.sqlite3
-data/
-backups/
 
-# Python environments, caches, and build output
-.venv/
-venv/
-env/
+# Python cache & build
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
+dist/
+build/
+
+# Testing & Coverage
 .pytest_cache/
-.ruff_cache/
-.mypy_cache/
 .coverage
 htmlcov/
-build/
-dist/
+.ruff_cache/
 
-# Editors and operating systems
+# IDE & OS
 .vscode/
 .idea/
 .DS_Store
