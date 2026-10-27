@@ -544,6 +544,7 @@ def execute_user_action(
                 action=req.action,
                 payload_hash=payload_hash,
                 status="in_progress",
+                telegram_binding_id=req.telegram_binding_id,
             )
             db.add(op)
             db.commit()
@@ -807,6 +808,85 @@ def execute_user_action(
             op.error_message = str(e)
             db.commit()
             return {"status": "SERVICE_ERROR", "message": str(e)}
+
+
+@router.get("/users/{user_id}/actions/{operation_id}")
+def get_user_action_status(
+    user_id: int,
+    operation_id: str,
+    telegram_user_id: int = Query(...),
+    chat_id: int = Query(...),
+    telegram_binding_id: str = Query(...),
+    request: Request = None,
+):
+    """Đọc trạng thái thao tác ghi từ sổ ActionOperation phục vụ đối soát.
+
+    Quy tắc an toàn:
+    - Chỉ đọc ledger; tuyệt đối không tạo operation hoặc gọi provider ghi.
+    - Kiểm tra user, Telegram binding và quyền hiện tại.
+    - Operation cũ thiếu binding không tự động trả kết quả chi tiết.
+    - Trả 'not_found' nếu chưa có trong sổ (không đồng nghĩa thao tác chưa từng xảy ra).
+    """
+    session_factory = request.app.state.session_factory
+    with session_factory() as db:
+        user = db.query(User).filter_by(id=user_id).first()
+        if not user or not user.active:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "USER_NOT_FOUND", "message": "User not found or inactive"},
+            )
+
+        tele_conn = user.telegram_connection
+        if (
+            not tele_conn
+            or tele_conn.telegram_user_id != telegram_user_id
+            or tele_conn.private_chat_id != chat_id
+            or tele_conn.binding_id != telegram_binding_id
+            or tele_conn.status != "connected"
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "TELEGRAM_BINDING_MISMATCH", "message": "Telegram binding mismatch or disconnected"},
+            )
+
+        op = db.query(ActionOperation).filter_by(user_id=user_id, operation_id=operation_id).first()
+        if not op:
+            return {
+                "operation_id": operation_id,
+                "action": None,
+                "status": "not_found",
+                "result": None,
+                "updated_at": None,
+            }
+
+        # Nếu operation đã lưu binding khác với binding đang yêu cầu -> từ chối
+        if op.telegram_binding_id and op.telegram_binding_id != telegram_binding_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "BINDING_MISMATCH", "message": "Operation belongs to another binding"},
+            )
+
+        # Trích xuất result nếu có
+        res_data = None
+        if op.status == "completed" and op.result_json:
+            # Nếu là operation cũ không có telegram_binding_id -> không tự động trả nội dung kết quả
+            if not op.telegram_binding_id:
+                res_data = None
+            else:
+                try:
+                    parsed = json.loads(op.result_json)
+                    res_data = parsed.get("result") if isinstance(parsed, dict) and "result" in parsed else parsed
+                except Exception:
+                    res_data = None
+
+        up_at = op.updated_at or op.created_at
+        return {
+            "operation_id": op.operation_id,
+            "action": op.action,
+            "status": op.status,
+            "result": res_data,
+            "updated_at": up_at.isoformat() if up_at else None,
+        }
 
 
 @router.get("/users/{user_id}/calendar/events/{event_id}")
