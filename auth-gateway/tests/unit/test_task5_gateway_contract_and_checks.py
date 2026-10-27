@@ -1,12 +1,12 @@
-import json
-import pytest
 from unittest.mock import MagicMock, patch
-from fastapi.testclient import TestClient
-from cryptography.fernet import Fernet
 
-from app.main import create_app
-from app.models import User, OdooCredential, GoogleConnection
+import pytest
+from cryptography.fernet import Fernet
+from fastapi.testclient import TestClient
+
 from app.config import Settings
+from app.main import create_app
+from app.models import GoogleConnection, OdooCredential, User
 
 
 @pytest.fixture
@@ -46,7 +46,7 @@ def gateway_test_env(tmp_path):
             encrypted_secret=enc_sec,
         )
         db.add(cred)
-        from datetime import datetime, UTC, timedelta
+        from datetime import UTC, datetime, timedelta
         g_conn = GoogleConnection(
             user_id=1,
             email="user@gmail.com",

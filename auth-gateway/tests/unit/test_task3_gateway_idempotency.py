@@ -1,10 +1,10 @@
-import pytest
 import threading
-from unittest.mock import MagicMock, patch
-from fastapi.testclient import TestClient
-from datetime import datetime, UTC, timedelta
+from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
+
+import pytest
 from cryptography.fernet import Fernet
-import httpx
+from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
@@ -112,7 +112,8 @@ def test_action_in_progress_expired_becomes_unknown_result(test_setup):
     # Tạo bản ghi in_progress từ 60 giây trước
     with session_factory() as db:
         old_time = datetime.now(UTC) - timedelta(seconds=60)
-        import hashlib, json
+        import hashlib
+        import json
         p_hash = hashlib.sha256(json.dumps({"action": "calendar.create", "arguments": {"summary": "Old"}}, sort_keys=True).encode()).hexdigest()
         op = ActionOperation(
             operation_id="op_expired_in_progress",

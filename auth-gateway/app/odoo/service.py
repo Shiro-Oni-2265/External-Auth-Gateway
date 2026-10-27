@@ -1,12 +1,9 @@
 from typing import Any
 
 from app.odoo.client import (
-    OdooClient,
-    OdooError,
-    OdooAuthError,
     OdooAccessError,
-    OdooNetworkError,
     OdooAccountInactiveError,
+    OdooClient,
     OdooExternalUserError,
 )
 
@@ -93,9 +90,9 @@ class OdooService:
             if records and isinstance(records, list) and len(records) > 0:
                 rec = records[0]
                 dept = rec.get("department_id")
-                department = dept[1] if isinstance(dept, (list, tuple)) and len(dept) > 1 else None
+                department = dept[1] if isinstance(dept, list | tuple) and len(dept) > 1 else None
                 mgr = rec.get("parent_id")
-                manager_name = mgr[1] if isinstance(mgr, (list, tuple)) and len(mgr) > 1 else None
+                manager_name = mgr[1] if isinstance(mgr, list | tuple) and len(mgr) > 1 else None
                 job_title = rec.get("job_title") or None
                 return {
                     "job_title": job_title,
@@ -188,7 +185,7 @@ class OdooService:
             if has_gmail_send:
                 perms.add("gmail.send")
 
-        return sorted(list(perms))
+        return sorted(perms)
 
     def create_lead(
         self,
@@ -219,12 +216,13 @@ class OdooService:
         if expected_revenue is not None:
             vals["expected_revenue"] = float(expected_revenue)
         if stage_id is not None:
+            stage_domain = [("id", "=", stage_id)]
             stages = self.client.execute(
                 uid=uid,
                 secret=secret,
                 model="crm.stage",
                 method="search_read",
-                args=[[[("id", "=", stage_id)]]],
+                args=[stage_domain],
                 kwargs={"fields": ["id", "name"], "limit": 1},
             )
             if not stages:
@@ -246,12 +244,13 @@ class OdooService:
             "id", "name", "contact_name", "email_from", "phone",
             "expected_revenue", "stage_id", "write_date", "user_id"
         ]
+        domain = [("id", "=", lead_id)]
         records = self.client.execute(
             uid=uid,
             secret=secret,
             model="crm.lead",
             method="search_read",
-            args=[[[("id", "=", lead_id)]]],
+            args=[domain],
             kwargs={"fields": fields, "limit": 1},
         )
         if records and isinstance(records, list) and len(records) > 0:
@@ -274,12 +273,13 @@ class OdooService:
     ) -> dict[str, Any]:
         """Cập nhật lead/opportunity trong crm.lead.
         Kiểm tra ID bản ghi và quyền truy cập giai đoạn CRM. Không cho chỉnh chủ sở hữu/công ty."""
+        domain = [("id", "=", lead_id)]
         existing = self.client.execute(
             uid=uid,
             secret=secret,
             model="crm.lead",
             method="search_read",
-            args=[[[("id", "=", lead_id)]]],
+            args=[domain],
             kwargs={"fields": ["id", "name", "stage_id", "user_id", "write_date"], "limit": 1},
         )
         if not existing:
@@ -308,12 +308,13 @@ class OdooService:
         if expected_revenue is not None:
             vals["expected_revenue"] = float(expected_revenue)
         if stage_id is not None:
+            stage_domain = [("id", "=", stage_id)]
             stages = self.client.execute(
                 uid=uid,
                 secret=secret,
                 model="crm.stage",
                 method="search_read",
-                args=[[[("id", "=", stage_id)]]],
+                args=[stage_domain],
                 kwargs={"fields": ["id", "name"], "limit": 1},
             )
             if not stages:

@@ -1,12 +1,13 @@
+from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
+
 import pytest
-from datetime import datetime, timedelta, UTC
-from unittest.mock import MagicMock, patch
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
-from app.models import OdooCredential, TelegramConnection, User, GoogleConnection
+from app.models import GoogleConnection, OdooCredential, TelegramConnection, User
 from app.security import encrypt_secret
 
 

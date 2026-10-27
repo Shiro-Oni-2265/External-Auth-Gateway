@@ -1,6 +1,5 @@
-import pytest
-from datetime import datetime, UTC
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
+
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 

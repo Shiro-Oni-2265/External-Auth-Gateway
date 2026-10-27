@@ -1,5 +1,5 @@
-import pytest
 from unittest.mock import MagicMock
+
 from app.odoo.service import OdooService
 
 

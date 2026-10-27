@@ -131,14 +131,52 @@ Cấu hình `CLOUDFLARE_TUNNEL_TOKEN` trước khi chạy thêm service `tunnel`
 
 Nếu chuyển tiếp tới dịch vụ AI chạy trong container khác, đặt `AI_AGENT_BASE_URL` theo địa chỉ truy cập được từ container gateway. Có thể dùng mạng `auth_gateway_net` và tên service/alias của dịch vụ đích. `localhost` trong container chỉ trỏ về chính container; cổng nội bộ gateway là `8000`.
 
-## Kiểm thử
+## Kiểm thử và kiểm tra mã nguồn (Linting)
 
 ```powershell
-# Chạy toàn bộ test suite của Gateway (134/134 test đạt):
+# Kiểm tra định dạng và chuẩn mã nguồn (Ruff sạch 100%, 0 lỗi):
+.\.venv\Scripts\python.exe -m ruff check app tests
+
+# Chạy toàn bộ test suite của Gateway (142/142 test đạt, 0 lỗi):
 .\.venv\Scripts\python.exe -m pytest -v
+
+# (Tùy chọn) Chạy riêng nhóm test tích hợp xuyên dịch vụ (5/5 test đạt):
+.\.venv\Scripts\python.exe -m pytest tests/integration/test_full_lifecycle_cross_app.py tests/integration/test_live_cross_app_e2e.py -v
 ```
 
-Toàn bộ **134 test** tự động (bao gồm unit test, contract API, worker idempotency và integration cross-app) đều đã chạy thành công. Các test hệ thống dùng cơ sở dữ liệu tạm thời và mock ở biên Odoo/Google/Telegram.
+### Kết quả xác minh và phạm vi đã kiểm chứng
+
+- **142 test tự động đạt 100%**: Bao gồm unit test, contract API v2, worker idempotency, hàng đợi Telegram, xử lý atomic lease, sweep sending và integration cross-app.
+- **Regression test XML-RPC CRM (`test_crm_rpc_domain_regression.py`)**: Đã bổ sung 8 test chuyên biệt với mock XML-RPC khắt khe, xác minh 4 vị trí gọi `search_read` (tạo lead có stage, đọc chi tiết lead, đọc bản ghi trước khi update lead, kiểm tra stage khi update lead) tuân thủ đúng cấu trúc `domain = [("id", "=", record_id)]` và `args = [domain]`. Mock từ chối hoàn toàn domain lồng sai cấu trúc, kiểm tra xung đột `write_date` và bảo đảm không gọi `create`/`write` khi bị từ chối.
+- **Ruff Linting**: Toàn bộ codebase `app` và `tests` đạt chuẩn Ruff sạch hoàn toàn, không còn cảnh báo hoặc lỗi. Exception chaining (`from e` / `from err`) được áp dụng chuẩn hóa trong khi giữ nguyên mã lỗi API và HTTP status code.
+- **Git diff**: Kiểm tra `git diff --check` đạt chuẩn, không có lỗi định dạng hay khoảng trắng thừa.
+
+> **Lưu ý quan trọng về phạm vi kiểm thử:**
+> Toàn bộ 142 test tự động được chạy trong môi trường kiểm thử cô lập (dùng SQLite tạm thời trong bộ nhớ và mock proxy ở tầng biên XML-RPC / Google / Telegram). Kiểm thử tự động chứng minh tính toàn vẹn của logic nghiệp vụ và contract API, nhưng **không thay thế việc nghiệm thu bằng tài khoản thật**. Người dùng cần tự nghiệm thu với tenant Odoo Online thật, tài khoản Google OAuth thật và bot Telegram thật theo checklist bên dưới.
+
+## Checklist tự nghiệm thu bằng tài khoản thật (Dành cho người dùng)
+
+Người dùng thực hiện lần lượt 5 bước kiểm thử thực tế sau khi cấu hình đầy đủ thông tin vào `.env`:
+
+1. **Đăng nhập Odoo và liên kết Telegram/Google:**
+   - Truy cập portal [http://localhost:8080](http://localhost:8080), đăng nhập bằng URL tenant, database, email và API key/mật khẩu Odoo thật.
+   - Nhấn nút liên kết Telegram, mở bot và bấm `/start` để hoàn tất ghép nối.
+   - Nhấn nút liên kết Google, đăng nhập tài khoản Google (hỗ trợ cả Gmail cá nhân nếu để trống `GOOGLE_WORKSPACE_DOMAINS`) và cấp đủ quyền Calendar/Gmail.
+2. **Kiểm tra hồ sơ, quyền, lịch, Gmail và CRM:**
+   - Trên Telegram bot, gửi các lệnh: `Tôi là ai?`, `Kiểm tra kết nối`, `/calendar list`, `/email list`, `/crm search <từ khóa>`.
+   - Đối chiếu kết quả trả về với thông tin nhân viên trong Odoo và dữ liệu thực tế trên Google Workspace.
+3. **Tạo và sửa dữ liệu thử nghiệm (Task, Calendar, CRM):**
+   - Gửi lệnh tạo/sửa lịch: `/calendar create [TEST] Họp dự án | 2026-11-05T09:00:00+07:00 | 2026-11-05T10:00:00+07:00`.
+   - Gửi lệnh tạo lead CRM: `/crm create [TEST] Khách hàng tiềm năng | 0900000000 | test@example.com | 5000000`.
+   - Kiểm tra bot phản hồi tin nhắn bản xem trước (preview) kèm mã xác nhận.
+   - Gửi `/confirm <mã>` -> kiểm tra thông báo hoàn thành và kiểm tra bản ghi tương ứng đã xuất hiện trên Google Calendar và CRM Odoo thật.
+4. **Gửi một email thử nghiệm:**
+   - Gửi lệnh: `/email send <email-cá-nhân-của-bạn> | [TEST] Email thử nghiệm | Xin chào, đây là email kiểm tra tích hợp.`
+   - Kiểm tra bản xem trước, gửi `/confirm <mã>` và kiểm tra email thực tế đã đến hộp thư người nhận.
+5. **Kiểm tra thiếu quyền, hủy xác nhận, confirm lại và ngắt/ghép nối lại Telegram:**
+   - Tạo một thao tác mới, nhận mã preview rồi gửi `/cancel <mã>` -> kiểm tra thao tác bị hủy và không có bản ghi nào bị ghi ra ngoài.
+   - Thử gửi lại `/confirm <mã>` cho mã đã hủy hoặc đã thực thi -> kiểm tra hệ thống từ chối hoặc trả kết quả đã lưu, không thực thi trùng lặp.
+   - Trên portal, thử hủy liên kết Telegram và gửi lệnh trên bot -> kiểm tra bot từ chối yêu cầu do chưa ghép nối danh tính. Sau đó ghép nối lại bằng token mới và xác nhận bot hoạt động bình thường trở lại.
 
 ## Giới hạn hiện tại và lưu ý vận hành
 

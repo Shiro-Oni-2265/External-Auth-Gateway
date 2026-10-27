@@ -1,19 +1,18 @@
-import pytest
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
+
+import pytest
 from fastapi.testclient import TestClient
 
-from app.main import create_app
 from app.config import Settings
-from app.odoo.client import OdooClient, OdooAccessError, OdooAuthError, OdooNetworkError
+from app.main import create_app
+from app.models import GoogleConnection, OdooCredential, TelegramConnection, User
+from app.odoo.client import OdooAccessError, OdooClient, OdooNetworkError
 from app.odoo.service import (
-    OdooService,
     OdooAccountInactiveError,
     OdooExternalUserError,
+    OdooService,
 )
-from app.models import Base, User, OdooCredential, TelegramConnection, GoogleConnection
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 from app.security import encrypt_secret
 
 

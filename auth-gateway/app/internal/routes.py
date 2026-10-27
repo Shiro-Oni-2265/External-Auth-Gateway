@@ -44,33 +44,33 @@ def _verify_odoo_account(odoo_svc: OdooService | None, uid: int, secret: str) ->
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "ODOO_ACCOUNT_INACTIVE", "message": str(e)},
-        )
+        ) from e
     except OdooExternalUserError as e:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "EXTERNAL_USER_FORBIDDEN", "message": str(e)},
-        )
+        ) from e
     except (OdooAuthError, OdooAccessError) as e:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "ODOO_CREDENTIAL_INVALID", "message": f"Xác thực Odoo thất bại: {e}"},
-        )
+        ) from e
     except OdooNetworkError as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"code": "ODOO_UNAVAILABLE", "message": f"Mất kết nối hoặc quá hạn chờ Odoo: {e}"},
-        )
+        ) from e
     except Exception as e:
         err_msg = str(e).lower()
         if "timeout" in err_msg or "connection" in err_msg:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "ODOO_UNAVAILABLE", "message": f"Lỗi kết nối Odoo: {e}"},
-            )
+            ) from e
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "ODOO_CREDENTIAL_INVALID", "message": f"Không thể xác minh tài khoản Odoo: {e}"},
-        )
+        ) from e
 
 router = APIRouter(
     prefix="/internal/v1",
@@ -523,7 +523,7 @@ def execute_user_action(
             )
             db.add(op)
             db.commit()
-        except IntegrityError:
+        except IntegrityError as err:
             db.rollback()
             op = db.query(ActionOperation).filter_by(user_id=user_id, operation_id=req.operation_id).first()
             if op:
@@ -531,7 +531,7 @@ def execute_user_action(
                     raise HTTPException(
                         status_code=status.HTTP_409_CONFLICT,
                         detail={"code": "PAYLOAD_MISMATCH", "message": f"operation_id '{req.operation_id}' đã tồn tại với tham số khác."},
-                    )
+                    ) from err
                 if op.status == "completed":
                     return json.loads(op.result_json) if op.result_json else {"status": "completed"}
                 if op.status == "in_progress":
@@ -759,8 +759,9 @@ def execute_user_action(
                 return final_res
 
         except Exception as e:
-            from app.google.oauth import GoogleAuthRevokedError
             import httpx
+
+            from app.google.oauth import GoogleAuthRevokedError
 
             if isinstance(e, GoogleAuthRevokedError):
                 op.status = "failed"
@@ -833,27 +834,28 @@ def get_calendar_event_detail(
         return {"status": "OK", "event": ev}
     except Exception as e:
         import httpx
+
         from app.google.oauth import GoogleAuthRevokedError
 
         if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 404:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "EVENT_NOT_FOUND", "message": f"Không tìm thấy sự kiện lịch {event_id}"},
-            )
+            ) from e
         if isinstance(e, GoogleAuthRevokedError):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={"code": "RECONNECT_REQUIRED", "message": "Google token bị thu hồi hoặc cần xác thực lại."},
-            )
+            ) from e
         if isinstance(e, httpx.TimeoutException):
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "SERVICE_UNAVAILABLE", "message": "Quá thời gian chờ kết nối Google Calendar."},
-            )
+            ) from e
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": "SERVICE_ERROR", "message": str(e)},
-        )
+        ) from e
 
 
 @router.get("/users/{user_id}/crm/leads/{lead_id}")
@@ -898,15 +900,15 @@ def get_crm_lead_detail(
         try:
             lead = odoo_svc.get_lead_detail(uid=user.odoo_uid, secret=secret, lead_id=lead_id)
         except Exception as e:
-            if isinstance(e, (OdooNetworkError,)):
+            if isinstance(e, OdooNetworkError):
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail={"code": "ODOO_UNAVAILABLE", "message": f"Không thể kết nối Odoo: {e}"},
-                )
+                ) from e
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail={"code": "SERVICE_ERROR", "message": str(e)},
-            )
+            ) from e
 
         if not lead:
             raise HTTPException(
