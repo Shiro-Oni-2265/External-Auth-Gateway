@@ -11,8 +11,8 @@ Tài liệu này hướng dẫn cách kết nối, vận hành, kiểm thử và
         │
         ▼ (Tin nhắn /start, /help, /status, /crm) ──► Xử lý trực tiếp tại Gateway
   [Auth Gateway: 8080]
-        │
-        ▼ (Tin nhắn /today, "Hôm nay tôi có gì?", câu hỏi nghiệp vụ)
+        │ (Lưu update_id vào queue: pending, ACK webhook ngay lập tức)
+        ▼ (TelegramAIWorker chạy ngầm nhận turn với lease 90s)
     [POST /internal/v1/telegram/turn]
         │
         ▼
@@ -29,11 +29,12 @@ Tài liệu này hướng dẫn cách kết nối, vận hành, kiểm thử và
   - Quản lý đăng nhập Odoo, mã hóa token AES-256 Fernet.
   - Quản lý OAuth Google (Calendar, Gmail) và duy trì làm mới token tự động.
   - Điểm tiếp nhận Telegram bot duy nhất (Webhook hoặc Poller).
+  - Quản lý hàng đợi bền vững (`telegram_updates`) với state machine, lease và cơ chế phòng ngừa gửi trùng.
   - Cổng Portal người dùng (`http://localhost:8080/portal/dashboard`).
 - **AI Agent (Điều phối nghiệp vụ & Điểm tin):**
-  - Xử lý ngôn ngữ tự nhiên, phân tích ngữ cảnh người dùng.
-  - Tổng hợp điểm tin `/today` từ 100% dữ liệu thật, không dùng số liệu minh họa.
-  - Quản lý công việc cá nhân (`LocalTaskProvider`) phân tách theo `owner_key = "{tenant}:{database}:{odoo_uid}"`.
+  - Xử lý ngôn ngữ tự nhiên, phân tích ngữ cảnh người dùng qua `handle_user_turn()`.
+  - Tổng hợp điểm tin `/today` từ 100% dữ liệu thật, loại bỏ toàn bộ số liệu minh họa/giả lập.
+  - Quản lý công việc cá nhân (`LocalTaskProvider`) phân tách nghiêm ngặt theo `owner_key = "{tenant}:{database}:{odoo_uid}"`.
 
 ---
 
@@ -44,8 +45,8 @@ Tài liệu này hướng dẫn cách kết nối, vận hành, kiểm thử và
 PORT=8000
 INTEGRATION_MODE=gateway
 GATEWAY_BASE_URL=http://localhost:8080
-GATEWAY_TO_AGENT_SECRET=your_gateway_to_agent_secret_min32chars
-AGENT_TO_GATEWAY_SECRET=your_agent_to_gateway_secret_min32chars
+GATEWAY_TO_AGENT_SECRET=your_gateway_to_agent_secret_min32chars_unique_1
+AGENT_TO_GATEWAY_SECRET=your_agent_to_gateway_secret_min32chars_unique_2
 ```
 
 ### Trên Auth Gateway (`D:\Auth_gateway\auth-gateway\.env`)
@@ -53,12 +54,17 @@ AGENT_TO_GATEWAY_SECRET=your_agent_to_gateway_secret_min32chars
 PUBLIC_BASE_URL=http://localhost:8080
 ENABLE_AI_AGENT_FORWARDING=true
 AI_AGENT_BASE_URL=http://localhost:8000
-GATEWAY_TO_AGENT_SECRET=your_gateway_to_agent_secret_min32chars
-AGENT_TO_GATEWAY_SECRET=your_agent_to_gateway_secret_min32chars
+GATEWAY_TO_AGENT_SECRET=your_gateway_to_agent_secret_min32chars_unique_1
+AGENT_TO_GATEWAY_SECRET=your_agent_to_gateway_secret_min32chars_unique_2
 ```
 
 > [!IMPORTANT]
-> Hai secret `GATEWAY_TO_AGENT_SECRET` và `AGENT_TO_GATEWAY_SECRET` phải khớp nhau ở cả 2 phía. Mọi endpoint nội bộ đều sử dụng so sánh hằng số thời gian (`secrets.compare_digest`) để chống timing attack.
+> 1. Cả hai service secret `GATEWAY_TO_AGENT_SECRET` và `AGENT_TO_GATEWAY_SECRET` mặc định là chuỗi rỗng (`""`). Khi bật `INTEGRATION_MODE=gateway` hoặc `ENABLE_AI_AGENT_FORWARDING=true`, hệ thống bắt buộc hai secret này phải:
+>    - Có độ dài tối thiểu **32 ký tự**.
+>    - **Khác nhau hoàn toàn** giữa 2 chiều (Gateway→Agent và Agent→Gateway).
+>    - Nếu cấu hình rỗng, trùng hoặc quá ngắn, cả AI Agent và Gateway sẽ từ chối khởi động ngay lập tức.
+> 2. Mọi endpoint nội bộ đều sử dụng so sánh hằng số thời gian (`secrets.compare_digest`) để chống timing attack.
+> 3. Không để lộ secret sử dụng được trong mã nguồn hay `.env.example`.
 
 ---
 
@@ -79,27 +85,82 @@ AGENT_TO_GATEWAY_SECRET=your_agent_to_gateway_secret_min32chars
 
 ---
 
-## 4. Kiểm thử luồng điểm tin trên Telegram
+## 4. Quản lý hàng đợi Telegram & Cơ chế Chống gửi trùng
 
-Mở bot Telegram và gửi một trong các câu lệnh:
-- `/today`
-- *"Hôm nay tôi có gì?"*
-- *"Hôm nay tôi cần làm gì?"*
+### 4.1. Vòng đời xử lý bản ghi Telegram (`telegram_updates`)
 
-### Kết quả mong đợi:
-Agent trả về điểm tin định dạng Markdown chuẩn:
-1. **Lịch làm việc hôm nay:** Giờ bắt đầu - kết thúc, tên sự kiện, đường link Google Calendar (xử lý chuẩn sự kiện cả ngày).
-2. **Công việc cần xử lý:** Phân tách rõ ràng giữa *Việc quá hạn* và *Việc đến hạn hôm nay*, không hiển thị task của nhân viên khác.
-3. **Hộp thư Gmail:** Tổng số thư chưa đọc thật từ hộp thư đến và danh sách tối đa 5 email gần nhất kèm link mở trực tiếp.
-4. **Thời điểm truy xuất:** Hiển thị rõ mốc giờ và múi giờ nhân viên (`Asia/Bangkok`).
+```text
+pending ──► processing_ai ──► ai_received ──► processed
+                │
+                ├─► retry_wait ──► processing_ai (khi gặp lỗi mạng/timeout/5xx, tối đa 3 lần)
+                │
+                └─► failed (khi gặp HTTP 4xx, phản hồi sai cấu trúc, hoặc hết lượt retry)
+```
+
+- **Tiếp nhận không nghẽn:** Webhook lưu update và phản hồi HTTP 200 (ACK) ngay; poller lưu vào DB trước khi tăng offset. Update trùng bị chặn bởi unique index `update_id`.
+- **Worker xử lý nền (`TelegramAIWorker`):** Chạy thread riêng, quét mỗi giây; nhận bản ghi theo cơ chế cập nhật trạng thái có điều kiện (`UPDATE ... WHERE status IN ('pending', 'retry_wait') OR (status = 'processing_ai' AND lease_expires_at < :now)`).
+- **Lease và Timeout:**
+  - Lease gán cho worker là **90 giây**.
+  - Timeout gọi HTTP sang AI Agent là **25 giây**.
+- **Chính sách Retry:**
+  - Chỉ retry khi lỗi kết nối, timeout hoặc HTTP 5xx từ AI Agent.
+  - Tối đa **3 lần gọi** tổng cộng (chờ 5 giây lần 1, 30 giây lần 2).
+  - Lỗi HTTP 4xx hoặc cấu trúc phản hồi không hợp lệ chuyển ngay sang `failed`, không retry.
+  - Phản hồi từ AI được lưu ngay vào `ai_response` khi nhận thành công (`ai_received`); không bao giờ gọi lại AI nếu đã có phản hồi.
+
+### 4.2. Giao nhận tin nhắn Telegram & Trạng thái `delivery_unknown`
+
+- **Định dạng tin:** Phản hồi từ AI Agent được gửi qua Telegram bằng plain text chuẩn (`parse_mode=""`). Chỉ khi Telegram trả về mã lỗi xác nhận từ chối do định dạng (`can't parse entities` / `formatting`) mới fallback sang plain text.
+- **Theo dõi tiến độ chia đoạn (Chunk Delivery Tracking):**
+  - Danh sách đoạn tin được tuần tự hóa vào `delivery_chunks` (JSON).
+  - Sau mỗi đoạn được Telegram API xác nhận thành công (HTTP 200 từ Telegram), Gateway cập nhật `delivery_index`.
+  - Các đoạn đã gửi thành công **tuyệt đối không gửi lại**.
+- **Xử lý `delivery_unknown` (Không thể xác định trạng thái giao):**
+  - Nếu gặp timeout mạng hoặc mất kết nối trong khi gửi một đoạn tin đến Telegram (không biết Telegram đã nhận và hiển thị cho người dùng hay chưa):
+    - Đánh dấu `delivery_status = 'delivery_unknown'`.
+    - Cập nhật `status = 'failed'`.
+    - **Dừng gửi ngay lập tức và không tự động retry**.
+  - Khi khởi động lại dịch vụ (restart / crash recovery), các bản ghi còn dang dở ở trạng thái `sending` tự động chuyển sang `delivery_unknown` và `failed`, không tự phát lại để tránh spam người dùng.
 
 ---
 
-## 5. Quy trình Rollback & Tách rời độc lập
+## 5. Quy trình Vận hành & Đối soát thủ công (`delivery_unknown`)
 
-Nếu cần tạm dừng tích hợp để bảo trì hoặc điều tra sự cố:
-1. Đặt `ENABLE_AI_AGENT_FORWARDING=false` trong file `.env` của Auth Gateway.
+Khi gặp bản ghi có `delivery_status = 'delivery_unknown'`:
+
+1. **Truy vấn danh sách bản ghi nghi vấn:**
+   ```sql
+   SELECT id, update_id, telegram_chat_id, delivery_index, delivery_chunks, last_error, updated_at
+   FROM telegram_updates
+   WHERE delivery_status = 'delivery_unknown'
+   ORDER BY updated_at DESC;
+   ```
+2. **Đối soát:**
+   - Lấy `update_id` và mã tương quan `request_id` từ log hệ thống.
+   - Kiểm tra trên Telegram chat xem người dùng đã nhận được nội dung đoạn `delivery_index` hay chưa.
+   - Ghi chú: Nhật ký hệ thống chỉ ghi nhận mã định danh, `update_id` và `request_id`, tuyệt đối **không log nội dung email, thông tin nhạy cảm hay token**.
+3. **Quyết định thủ công:**
+   - Nếu tin chưa đến người dùng: Người dùng có thể gửi lại câu lệnh trên bot Telegram.
+   - Nếu tin đã đến: Giữ nguyên trạng thái `delivery_unknown` để phục vụ audit, không cần can thiệp DB.
+
+---
+
+## 6. Quy trình Khởi động lại & Rollback
+
+### Khởi động lại an toàn (Startup Recovery)
+Khi Gateway khởi động:
+- Tự động chạy migration an toàn bổ sung các cột: `lease_expires_at`, `retry_at`, `delivery_chunks`, `delivery_index`, `delivery_status`, `last_error`, `updated_at`.
+- Thực hiện recovery:
+  - Bản ghi `sending` dang dở -> chuyển sang `delivery_unknown` và `failed`.
+  - Bản ghi `processing_ai` hết hạn lease -> cho phép worker nhận lại.
+  - Bản ghi `retry_wait` và `pending` -> tiếp tục xử lý bình thường.
+  - Bản ghi `ai_received` -> worker tiếp tục giao các đoạn còn lại chưa gửi.
+
+### Rollback & Tách rời độc lập
+Nếu cần tạm dừng tích hợp AI Agent để bảo trì:
+1. Đặt `ENABLE_AI_AGENT_FORWARDING=false` trong `.env` của Auth Gateway.
 2. Khởi động lại dịch vụ Gateway.
 3. **Trạng thái sau rollback:**
-   - Gateway vẫn hoạt động bình thường, phục vụ đăng nhập portal, liên kết tài khoản và các lệnh `/start`, `/help`, `/status`, `/crm`.
-   - Các tin nhắn trò chuyện hoặc `/today` sẽ được Gateway phản hồi lịch sự rằng tính năng AI đang bảo trì, không chuyển tiếp sang AI Agent.
+   - Gateway không nhận hoặc xử lý yêu cầu AI mới.
+   - Vẫn phục vụ người dùng bình thường: Portal, OAuth Google, các lệnh `/start`, `/help`, `/status`, `/crm`.
+   - Các tin nhắn trò chuyện hoặc `/today` được Gateway phản hồi thông báo bảo trì, không gọi sang AI Agent.

@@ -1,4 +1,3 @@
-import json
 import logging
 from typing import Any
 
@@ -8,7 +7,7 @@ from fastapi.responses import JSONResponse
 from app.auth.routes import get_current_user
 from app.auth.service import AuthenticatedUser
 from app.config import Settings
-from app.models import TelegramConnection, TelegramUpdate
+from app.models import TelegramConnection
 from app.telegram.client import TelegramClient
 from app.telegram.service import TelegramService
 
@@ -27,23 +26,14 @@ def get_telegram_service(
 ) -> TelegramService:
     settings: Settings = request.app.state.settings
     session_factory = request.app.state.session_factory
-    from app.odoo.client import OdooClient
-
     odoo_client = getattr(request.app.state, "odoo_client", None)
-    if not odoo_client:
-        odoo_client = OdooClient(url=settings.ODOO_URL, db=settings.ODOO_DB)
+    from app.telegram.service import create_telegram_service
 
-    return TelegramService(
+    return create_telegram_service(
+        settings=settings,
         session_factory=session_factory,
         telegram_client=telegram_client,
-        bot_username=settings.TELEGRAM_BOT_USERNAME,
-        webhook_secret=settings.TELEGRAM_WEBHOOK_SECRET,
         odoo_client=odoo_client,
-        encryption_key=settings.ENCRYPTION_KEY or "dev_dummy_key_000000000000000000000=",
-        odoo_base_url=settings.ODOO_URL,
-        enable_ai_forwarding=settings.ENABLE_AI_AGENT_FORWARDING,
-        ai_agent_base_url=settings.AI_AGENT_BASE_URL,
-        gateway_to_agent_secret=settings.GATEWAY_TO_AGENT_SECRET,
     )
 
 
@@ -133,45 +123,5 @@ async def telegram_webhook(
             detail={"code": "INVALID_JSON", "message": f"Malformed JSON: {e}"},
         ) from e
 
-    update_id = payload.get("update_id")
-    if not update_id or not isinstance(update_id, int):
-        return {"status": "ignored", "reason": "Missing update_id"}
-
-    session_factory = request.app.state.session_factory
-
-    # 3. Idempotent persistence before ACK
-    is_duplicate = False
-    with session_factory() as db:
-        existing = db.query(TelegramUpdate).filter_by(update_id=update_id).first()
-        if existing:
-            is_duplicate = True
-        else:
-            db_update = TelegramUpdate(
-                update_id=update_id,
-                payload=json.dumps(payload),
-                status="pending",
-            )
-            db.add(db_update)
-            db.commit()
-
-    if is_duplicate:
-        return {"status": "ok", "note": "duplicate update_id ignored"}
-
-    # 4. Process update
-    try:
-        telegram_service.process_update_dict(payload)
-        with session_factory() as db:
-            up = db.query(TelegramUpdate).filter_by(update_id=update_id).first()
-            if up:
-                up.status = "processed"
-                db.commit()
-    except Exception as e:
-        _logger.exception(f"Error processing Telegram update {update_id}: {e}")
-        with session_factory() as db:
-            up = db.query(TelegramUpdate).filter_by(update_id=update_id).first()
-            if up:
-                up.status = "failed"
-                up.attempts += 1
-                db.commit()
-
-    return {"status": "ok"}
+    # 3. Ingest into queue and ACK immediately
+    return telegram_service.ingest_update(payload)

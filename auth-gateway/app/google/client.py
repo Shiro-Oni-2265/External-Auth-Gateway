@@ -96,7 +96,7 @@ class GoogleClient:
         headers = {}
         if etag:
             headers["If-Match"] = etag
-        resp = self._request(user_id, "PUT", url, json_data=event_data, headers=headers)
+        resp = self._request(user_id, "PATCH", url, json_data=event_data, headers=headers)
         resp.raise_for_status()
         return resp.json()
 
@@ -190,7 +190,7 @@ class GoogleClient:
                 user_id,
                 "GET",
                 f"{gmail_base}/messages",
-                params={"q": "is:unread", "maxResults": max_results},
+                params={"q": "in:inbox is:unread", "maxResults": max_results},
             )
             if resp.status_code == 403:
                 return {
@@ -202,16 +202,15 @@ class GoogleClient:
             resp.raise_for_status()
             data = resp.json()
 
-            total_unread = data.get("resultSizeEstimate", 0)
             msg_items = data.get("messages", [])
 
-            # Also check inbox label for accurate unread count if available
+            # Accurate unread count strictly from INBOX label
+            accurate_total = None
             try:
                 lbl_resp = self._request(user_id, "GET", f"{gmail_base}/labels/INBOX")
                 if lbl_resp.status_code == 200:
                     lbl_data = lbl_resp.json()
-                    if "messagesUnread" in lbl_data:
-                        total_unread = lbl_data["messagesUnread"]
+                    accurate_total = lbl_data.get("messagesUnread")
             except Exception:
                 pass
 
@@ -248,7 +247,7 @@ class GoogleClient:
 
             return {
                 "status": "OK",
-                "total_unread": total_unread,
+                "total_unread": accurate_total,
                 "messages": messages,
             }
         except Exception as e:
@@ -257,3 +256,31 @@ class GoogleClient:
             if isinstance(e, GoogleAuthRevokedError):
                 return {"status": "RECONNECT_REQUIRED", "total_unread": 0, "messages": []}
             return {"status": "ERROR", "total_unread": 0, "messages": [], "message": str(e)}
+
+    def send_email(
+        self,
+        user_id: int,
+        to: list[str] | str,
+        subject: str,
+        body_text: str,
+    ) -> dict[str, Any]:
+        """Gửi email qua Gmail API dưới tài khoản Google đã liên kết của người dùng."""
+        import base64
+        from email.mime.text import MIMEText
+
+        to_str = ", ".join(to) if isinstance(to, list) else to
+        msg = MIMEText(body_text, _charset="utf-8")
+        msg["To"] = to_str
+        msg["Subject"] = subject
+
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+        url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
+        resp = self._request(user_id, "POST", url, json_data={"raw": raw})
+        if resp.status_code == 403:
+            return {
+                "status": "PERMISSION_DENIED",
+                "message": "Chưa được cấp quyền gửi Gmail (cần scope gmail.send). Vui lòng mở Portal để cấp thêm quyền.",
+            }
+        resp.raise_for_status()
+        data = resp.json()
+        return {"status": "OK", "id": data.get("id"), "thread_id": data.get("threadId")}

@@ -89,6 +89,123 @@ class TelegramService:
             expires_at=expires_at,
         )
 
+    def _set_update_status(self, update_id: int, status: str) -> None:
+        with self.session_factory() as db:
+            from app.models import TelegramUpdate
+
+            db.query(TelegramUpdate).filter_by(update_id=update_id).update(
+                {
+                    "status": status,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            db.commit()
+
+    def ingest_update(self, update: dict[str, Any]) -> dict[str, Any]:
+        """Ingest update idempotently into telegram_updates queue.
+        Gateway commands (/start, /help, /status, /crm) are processed immediately.
+        Conversational AI turns are stored with status='pending' (or rejected if forwarding disabled).
+        """
+        message = update.get("message") or update.get("edited_message")
+        if not message:
+            return {"status": "ignored", "reason": "No message"}
+
+        update_id = update.get("update_id")
+        if not update_id or not isinstance(update_id, int):
+            return {"status": "ignored", "reason": "Invalid or missing update_id"}
+
+        chat = message.get("chat", {})
+        from_user = message.get("from", {})
+        chat_id = chat.get("id")
+        text = (message.get("text") or "").strip()
+
+        if (
+            not chat_id
+            or not text
+            or chat.get("type") != "private"
+            or from_user.get("is_bot", False)
+        ):
+            return {"status": "ignored", "reason": "Non-private or bot message"}
+
+        # Classify command BEFORE committing to queue
+        telegram_user_id = from_user.get("id")
+        username = from_user.get("username")
+        cmd_tokens = text.split() if text else []
+        cmd_part = cmd_tokens[0].lower() if cmd_tokens else ""
+        base_cmd = cmd_part.split("@")[0] if cmd_part.startswith("/") else ""
+
+        is_gw_cmd = False
+        if base_cmd in {"/start", "/help", "/status"}:
+            is_gw_cmd = True
+        elif base_cmd == "/crm":
+            sub_cmd = cmd_tokens[1].lower() if len(cmd_tokens) > 1 else ""
+            if sub_cmd in {"search", "create", "update"}:
+                is_gw_cmd = False
+            else:
+                is_gw_cmd = True
+
+        if is_gw_cmd:
+            initial_status = "gateway_command"
+        elif not self.enable_ai_forwarding:
+            initial_status = "processed"
+        else:
+            initial_status = "pending"
+
+        # Atomic insert into telegram_updates using unique constraint on update_id
+        import json
+
+        from sqlalchemy.exc import IntegrityError
+
+        from app.models import TelegramUpdate
+
+        with self.session_factory() as db:
+            try:
+                db_update = TelegramUpdate(
+                    update_id=update_id,
+                    payload=json.dumps(update, ensure_ascii=False),
+                    status=initial_status,
+                    delivery_status="none",
+                    attempts=0,
+                )
+                db.add(db_update)
+                db.commit()
+            except IntegrityError:
+                # Duplicate update_id: ignore idempotently
+                return {"status": "ok", "duplicate": True}
+
+        if is_gw_cmd:
+            try:
+                if base_cmd == "/start":
+                    parts = text.split(maxsplit=1)
+                    if len(parts) > 1:
+                        token_arg = parts[1].strip()
+                        self._handle_pairing(chat_id, telegram_user_id, username, token_arg)
+                    else:
+                        self._handle_start_help(chat_id, telegram_user_id)
+                elif base_cmd == "/help":
+                    self._handle_help(chat_id)
+                elif base_cmd == "/status":
+                    self._handle_status(chat_id, telegram_user_id)
+                elif base_cmd == "/crm":
+                    parts = text.split(maxsplit=1)
+                    search_query = parts[1].strip() if len(parts) > 1 else None
+                    self._handle_crm(chat_id, telegram_user_id, search_query)
+                self._set_update_status(update_id, "processed")
+            except Exception as e:
+                _logger.error(
+                    "Error executing gateway command %s for update %s: %s", base_cmd, update_id, e
+                )
+                self._set_update_status(update_id, "gateway_command_failed")
+        else:
+            # Conversational / AI Turn
+            if not self.enable_ai_forwarding:
+                self.telegram_client.send_message(
+                    chat_id,
+                    "ℹ️ Tính năng AI Agent hiện đang tạm dừng kết nối. Vui lòng thử lại sau hoặc sử dụng các lệnh /crm, /status.",
+                )
+
+        return {"status": "ok"}
+
     def process_update_dict(self, update: dict[str, Any]) -> None:
         message = update.get("message") or update.get("edited_message")
         if not message:
@@ -125,9 +242,14 @@ class TelegramService:
         elif base_cmd == "/status":
             self._handle_status(chat_id, telegram_user_id)
         elif base_cmd == "/crm":
-            parts = text.split(maxsplit=1)
-            search_query = parts[1].strip() if len(parts) > 1 else None
-            self._handle_crm(chat_id, telegram_user_id, search_query)
+            parts = text.split()
+            sub_cmd = parts[1].lower() if len(parts) > 1 else ""
+            if sub_cmd in {"search", "create", "update"}:
+                self._handle_ai_turn(update, chat_id, telegram_user_id, username, text)
+            else:
+                parts_legacy = text.split(maxsplit=1)
+                search_query = parts_legacy[1].strip() if len(parts_legacy) > 1 else None
+                self._handle_crm(chat_id, telegram_user_id, search_query)
         else:
             self._handle_ai_turn(update, chat_id, telegram_user_id, username, text)
 
@@ -180,10 +302,13 @@ class TelegramService:
                 return
             target_user_name = target_user.name
 
-            # 4. Upsert TelegramConnection
+            # 4. Upsert TelegramConnection with fresh binding_id
+            import secrets
+            fresh_binding_id = f"tg_bind_{secrets.token_hex(16)}"
             if existing_conn:
                 existing_conn.private_chat_id = chat_id
                 existing_conn.username = username
+                existing_conn.binding_id = fresh_binding_id
                 existing_conn.status = "connected"
             else:
                 user_conn = db.query(TelegramConnection).filter_by(user_id=target_user.id).first()
@@ -191,6 +316,7 @@ class TelegramService:
                     user_conn.telegram_user_id = telegram_user_id
                     user_conn.private_chat_id = chat_id
                     user_conn.username = username
+                    user_conn.binding_id = fresh_binding_id
                     user_conn.status = "connected"
                 else:
                     db.add(
@@ -199,6 +325,7 @@ class TelegramService:
                             telegram_user_id=telegram_user_id,
                             private_chat_id=chat_id,
                             username=username,
+                            binding_id=fresh_binding_id,
                             status="connected",
                         )
                     )
@@ -641,3 +768,29 @@ class TelegramService:
                         }
                     )
                     db.commit()
+
+
+def create_telegram_service(
+    settings: Any,
+    session_factory: sessionmaker,
+    telegram_client: TelegramClient | None = None,
+    odoo_client: OdooClient | None = None,
+) -> TelegramService:
+    """Unified factory for building TelegramService with consistent AI forwarding parameters."""
+    if telegram_client is None:
+        telegram_client = TelegramClient(bot_token=settings.TELEGRAM_BOT_TOKEN)
+    if odoo_client is None:
+        odoo_client = OdooClient(url=settings.ODOO_URL, db=settings.ODOO_DB)
+
+    return TelegramService(
+        session_factory=session_factory,
+        telegram_client=telegram_client,
+        bot_username=settings.TELEGRAM_BOT_USERNAME,
+        webhook_secret=settings.TELEGRAM_WEBHOOK_SECRET,
+        odoo_client=odoo_client,
+        encryption_key=settings.ENCRYPTION_KEY or "dev_dummy_key_000000000000000000000=",
+        odoo_base_url=settings.ODOO_URL,
+        enable_ai_forwarding=settings.ENABLE_AI_AGENT_FORWARDING,
+        ai_agent_base_url=settings.AI_AGENT_BASE_URL,
+        gateway_to_agent_secret=settings.GATEWAY_TO_AGENT_SECRET,
+    )

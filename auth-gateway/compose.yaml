@@ -14,6 +14,8 @@ services:
       - gateway_data:/data
     networks:
       - gateway_net
+    ports:
+      - "8080:8000"
     expose:
       - "8000"
     healthcheck:
