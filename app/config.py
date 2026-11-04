@@ -33,6 +33,21 @@ class Settings(BaseSettings):
     GATEWAY_TO_AGENT_SECRET: str = ""
     AGENT_TO_GATEWAY_SECRET: str = ""
 
+    ENABLE_REPORTING: bool = False
+    ENABLE_QUOTATIONS: bool = False
+    ENABLE_BUSINESS_ACTIONS: bool = False
+    ENABLE_QUOTATION_APPROVAL_FLOW: bool = False
+    ENABLE_BUSINESS_CONTACTS: bool = False
+    ENABLE_BUSINESS_PRODUCTS: bool = False
+    ENABLE_BUSINESS_CRM: bool = False
+    ENABLE_BUSINESS_SALES: bool = False
+    ENABLE_BUSINESS_PURCHASES: bool = False
+    ENABLE_BUSINESS_STOCK: bool = False
+    ENABLE_BUSINESS_ACTIVITIES: bool = False
+    ENABLE_BUSINESS_NOTES: bool = False
+    ENABLE_BUSINESS_DELETE: bool = False
+    ENABLE_BUSINESS_EMAIL: bool = False
+
     # Optional Cloudflare
     CLOUDFLARE_TUNNEL_TOKEN: str = ""
 

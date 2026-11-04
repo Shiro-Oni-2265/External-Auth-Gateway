@@ -141,6 +141,17 @@ class OdooService:
                     # Lỗi kiểm tra một quyền không giữ lại kết quả chưa xác minh đầy đủ
                     pass
 
+        # Sales creation requires both the document and its lines to be creatable.
+        if secret and is_internal_user:
+            try:
+                if all(self.client.execute(
+                    uid=uid, secret=secret, model=model,
+                    method="check_access_rights", args=["create", False],
+                ) for model in ("sale.order", "sale.order.line")):
+                    perms.add("sales.create")
+            except Exception:
+                pass
+
         # 3. Google: quyền phụ thuộc trạng thái kết nối và scopes chính xác
         if google_status == "connected" and google_scopes:
             scopes = [s.lower() for s in google_scopes]
@@ -185,6 +196,9 @@ class OdooService:
             if has_gmail_send:
                 perms.add("gmail.send")
 
+        if google_status == "connected":
+            from app.workspace.catalog import permissions_for
+            perms.update(permissions_for(google_scopes or []))
         return sorted(perms)
 
     def create_lead(
@@ -341,6 +355,7 @@ class OdooService:
         limit: int | None = None,
         offset: int | None = None,
         order: str | None = None,
+        count_only: bool = False,
     ) -> dict[str, Any]:
         """Thực hiện truy vấn đọc an toàn qua Whitelist Catalog bằng credential của chính người dùng.
 
@@ -357,6 +372,27 @@ class OdooService:
             order=order,
         )
 
+        import logging
+        logger = logging.getLogger(__name__)
+
+        if count_only:
+            count_res = self.client.execute(
+                uid=uid,
+                secret=secret,
+                model=val_model,
+                method="search_count",
+                args=[val_domain],
+            )
+            total_count = count_res if isinstance(count_res, int) else 0
+            return {
+                "items": [],
+                "count": 0,
+                "total_count": total_count,
+                "limit": val_limit,
+                "offset": val_offset,
+                "model": val_model,
+            }
+
         records = self.client.execute(
             uid=uid,
             secret=secret,
@@ -372,9 +408,27 @@ class OdooService:
         )
 
         items = records if isinstance(records, list) else []
+
+        if len(items) < val_limit and val_offset == 0:
+            total_count = len(items)
+        else:
+            try:
+                c = self.client.execute(
+                    uid=uid,
+                    secret=secret,
+                    model=val_model,
+                    method="search_count",
+                    args=[val_domain],
+                )
+                total_count = c if isinstance(c, int) else len(items)
+            except Exception as e:
+                logger.warning("Failed to search_count for %s: %s", val_model, e)
+                total_count = len(items)
+
         return {
             "items": items,
             "count": len(items),
+            "total_count": total_count,
             "limit": val_limit,
             "offset": val_offset,
             "model": val_model,
