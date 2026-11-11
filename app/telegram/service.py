@@ -135,7 +135,7 @@ class TelegramService:
         base_cmd = cmd_part.split("@")[0] if cmd_part.startswith("/") else ""
 
         is_gw_cmd = False
-        if base_cmd in {"/start", "/help"} or (base_cmd == "/status" and len(cmd_tokens) == 1):
+        if base_cmd in {"/start", "/help", "/verify"} or (base_cmd == "/status" and len(cmd_tokens) == 1):
             is_gw_cmd = True
         elif base_cmd == "/crm":
             sub_cmd = cmd_tokens[1].lower() if len(cmd_tokens) > 1 else ""
@@ -158,11 +158,15 @@ class TelegramService:
 
         from app.models import TelegramUpdate
 
+        stored_update = update
+        if base_cmd == "/verify":
+            message_key = "message" if update.get("message") else "edited_message"
+            stored_update = {**update, message_key: {**message, "text": "/verify"}}
         with self.session_factory() as db:
             try:
                 db_update = TelegramUpdate(
                     update_id=update_id,
-                    payload=json.dumps(update, ensure_ascii=False),
+                    payload=json.dumps(stored_update, ensure_ascii=False),
                     status=initial_status,
                     delivery_status="none",
                     attempts=0,
@@ -182,6 +186,8 @@ class TelegramService:
                         self._handle_pairing(chat_id, telegram_user_id, username, token_arg)
                     else:
                         self._handle_start_help(chat_id, telegram_user_id)
+                elif base_cmd == "/verify":
+                    self._handle_browser_verification(chat_id, telegram_user_id, username, cmd_tokens)
                 elif base_cmd == "/help":
                     self._handle_help(chat_id)
                 elif base_cmd == "/status":
@@ -237,6 +243,8 @@ class TelegramService:
                 self._handle_pairing(chat_id, telegram_user_id, username, token_arg)
             else:
                 self._handle_start_help(chat_id, telegram_user_id)
+        elif base_cmd == "/verify":
+            self._handle_browser_verification(chat_id, telegram_user_id, username, text.split())
         elif base_cmd == "/help":
             self._handle_help(chat_id)
         elif base_cmd == "/status" and len(text.split()) > 1:
@@ -255,6 +263,20 @@ class TelegramService:
         else:
             self._handle_ai_turn(update, chat_id, telegram_user_id, username, text)
 
+    def _handle_browser_verification(
+        self, chat_id: int, telegram_user_id: int, username: str | None, tokens: list[str],
+    ) -> None:
+        from app.telegram.web_verification import confirm_browser_code
+
+        settings = getattr(self, "settings", None)
+        if not settings or len(tokens) != 2:
+            message = "Hãy sao chép lệnh /verify từ portal Odoo."
+        else:
+            message = confirm_browser_code(
+                self.session_factory, settings, chat_id, telegram_user_id, username, tokens[1],
+            )
+        self.telegram_client.send_message(chat_id, message)
+
     def _handle_pairing(
         self,
         chat_id: int,
@@ -262,6 +284,11 @@ class TelegramService:
         username: str | None,
         token_arg: str,
     ) -> None:
+        if getattr(getattr(self, "settings", None), "ODOO_EMPLOYEE_TELEGRAM_ID_FIELD", ""):
+            self.telegram_client.send_message(
+                chat_id, "Vui lòng xác minh tài khoản Telegram trên cổng Auth Gateway.",
+            )
+            return
         token_hash = hash_token(token_arg)
         now = datetime.now(UTC)
 
@@ -695,7 +722,7 @@ class TelegramService:
             import httpx
 
             try:
-                resp = httpx.post(ai_url, json=req_payload, headers=headers, timeout=25.0)
+                resp = httpx.post(ai_url, json=req_payload, headers=headers, timeout=35.0)
                 if resp.status_code == 200:
                     data = resp.json()
                     if data.get("request_id") != req_payload["request_id"]:

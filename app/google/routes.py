@@ -12,7 +12,7 @@ router = APIRouter(tags=["Google Workspace"])
 def get_google_oauth_service(request: Request) -> GoogleOAuthService:
     settings: Settings = request.app.state.settings
     session_factory = request.app.state.session_factory
-    redirect_uri = f"{settings.PUBLIC_BASE_URL.rstrip('/')}/oauth/google/callback"
+    redirect_uri = settings.google_redirect_uri
 
     return GoogleOAuthService(
         session_factory=session_factory,

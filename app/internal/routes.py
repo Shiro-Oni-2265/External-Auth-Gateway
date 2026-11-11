@@ -92,7 +92,7 @@ class IdentityResolveRequest(BaseModel):
 def _get_google_client(request: Request) -> GoogleClient:
     settings = request.app.state.settings
     session_factory = request.app.state.session_factory
-    redirect_uri = f"{settings.PUBLIC_BASE_URL.rstrip('/')}/oauth/google/callback"
+    redirect_uri = settings.google_redirect_uri
     oauth_service = GoogleOAuthService(
         session_factory=session_factory,
         client_id=settings.GOOGLE_CLIENT_ID,

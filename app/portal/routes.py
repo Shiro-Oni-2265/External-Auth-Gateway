@@ -1,14 +1,18 @@
+import re
 import secrets
 from pathlib import Path
 from typing import Any
 
+from cryptography.fernet import InvalidToken
 from fastapi import APIRouter, Cookie, Depends, Form, HTTPException, Request, status
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from app.auth.routes import get_auth_service
-from app.auth.service import AuthService
+from app.auth.service import AuthenticatedUser, AuthService
 from app.models import CalendarPair, GoogleConnection, SyncIntent, TelegramConnection, User
+from app.odoo.client import OdooClient, OdooError
+from app.odoo.service import OdooService
 
 router = APIRouter(tags=["Portal"])
 
@@ -57,10 +61,30 @@ def login_page(
     return response
 
 
+def _telegram_portal_state(
+    request: Request, user: AuthenticatedUser, connection: TelegramConnection | None, auth: AuthService,
+) -> str:
+    if not connection or not connection.verified_on_web:
+        return "not_verified"
+    field = request.app.state.settings.ODOO_EMPLOYEE_TELEGRAM_ID_FIELD
+    if not field:
+        return "unavailable"
+    try:
+        secret = auth.get_user_secret(user.id)
+        if not secret:
+            return "unavailable"
+        odoo = OdooService(OdooClient(url=user.tenant, db=user.database))
+        expected_id = odoo.get_employee_telegram_id(user.odoo_uid, secret, field)
+    except (OdooError, InvalidToken):
+        return "unavailable"
+    return "verified" if expected_id == connection.telegram_user_id else "mismatch"
+
+
 @router.get("/", response_class=HTMLResponse)
 def dashboard_page(
     request: Request,
     user_data: tuple[Any, str] | None = Depends(get_current_user_portal),
+    auth: AuthService = Depends(get_auth_service),
 ):
     if not user_data:
         return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
@@ -125,6 +149,14 @@ def dashboard_page(
             },
         ]
 
+    telegram_state = _telegram_portal_state(request, user, telegram_conn, auth)
+    telegram_verified = telegram_state == "verified"
+    settings = request.app.state.settings
+    bot_username = settings.TELEGRAM_BOT_USERNAME.strip().lstrip("@")
+    telegram_bot_url = None
+    if telegram_verified and re.fullmatch(r"[A-Za-z0-9_]+", bot_username):
+        telegram_bot_url = f"https://t.me/{bot_username}"
+
     return templates.TemplateResponse(
         request=request,
         name="dashboard.html",
@@ -132,12 +164,59 @@ def dashboard_page(
             "user": user_db,
             "google_conn": google_conn,
             "telegram_conn": telegram_conn,
+            "telegram_verified": telegram_verified,
+            "telegram_state": telegram_state,
+            "telegram_bot_url": telegram_bot_url,
+            "telegram_web_enabled": bool(request.app.state.settings.ODOO_EMPLOYEE_TELEGRAM_ID_FIELD),
+            "telegram_web_configured": request.app.state.settings.telegram_web_configured,
             "conflicts": conflicts,
             "ambiguous_intents": ambiguous_intents,
             "calendar_active": calendar_active,
             "workspace_apps": workspace_apps,
             "csrf_token": csrf_token,
         },
+    )
+
+
+@router.get("/connections/telegram/verification-status")
+def telegram_verification_status(
+    request: Request,
+    user_data: tuple[Any, str] | None = Depends(get_current_user_portal),
+    auth: AuthService = Depends(get_auth_service),
+):
+    if not user_data:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+    user, _ = user_data
+    with request.app.state.session_factory() as db:
+        connection = db.query(TelegramConnection).filter_by(user_id=user.id).first()
+        revision = connection.updated_at.isoformat() if connection and connection.updated_at else ""
+    state = _telegram_portal_state(request, user, connection, auth)
+    return JSONResponse(
+        {"verified": state == "verified", "state": state, "revision": revision},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.get("/connections/telegram/verification-options", response_class=HTMLResponse)
+def telegram_verification_options(
+    request: Request,
+    user_data: tuple[Any, str] | None = Depends(get_current_user_portal),
+):
+    if not user_data:
+        return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
+    settings = request.app.state.settings
+    if not settings.ODOO_EMPLOYEE_TELEGRAM_ID_FIELD:
+        return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+    user, csrf_token = user_data
+    return templates.TemplateResponse(
+        request=request,
+        name="telegram_verification_page.html",
+        context={
+            "user": user,
+            "csrf_token": csrf_token,
+            "telegram_web_configured": settings.telegram_web_configured,
+        },
+        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -183,7 +262,7 @@ def sync_calendar_now(
         session_factory,
         settings.GOOGLE_CLIENT_ID,
         settings.GOOGLE_CLIENT_SECRET,
-        f"{settings.PUBLIC_BASE_URL.rstrip('/')}/oauth/google/callback",
+        settings.google_redirect_uri,
         settings.ENCRYPTION_KEY or "",
         settings.GOOGLE_WORKSPACE_DOMAINS,
     )

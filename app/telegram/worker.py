@@ -645,7 +645,7 @@ class TelegramAIWorker:
                 )
                 return False
 
-        # Call AI Agent (Timeout 25s)
+        # Call AI Agent (Timeout 35s)
         ai_url = f"{self.settings.AI_AGENT_BASE_URL.rstrip('/')}/internal/v1/telegram/turn"
         request_id = f"tg-{update_id}"
         req_payload = {
@@ -671,7 +671,7 @@ class TelegramAIWorker:
                 "Content-Type": "application/json",
             }
             resp = httpx.post(ai_url, json=req_payload, headers=headers,
-                              timeout=75.0 if getattr(self.settings, 'ENABLE_QUOTATION_APPROVAL_FLOW', False) else 25.0)
+                              timeout=75.0 if getattr(self.settings, 'ENABLE_QUOTATION_APPROVAL_FLOW', False) else 35.0)
             t_ai = time.time() - t_ai_start
             _logger.info("TIMING_AI: request_id=%s duration=%.3fs status=%s", request_id, t_ai, resp.status_code)
 

@@ -54,7 +54,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             from app.odoo.client import OdooClient
             from app.telegram.client import TelegramClient
 
-            redirect_uri = f"{settings.PUBLIC_BASE_URL.rstrip('/')}/oauth/google/callback"
+            redirect_uri = settings.google_redirect_uri
             google_oauth = GoogleOAuthService(
                 session_factory=session_factory,
                 client_id=settings.GOOGLE_CLIENT_ID,

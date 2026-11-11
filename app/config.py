@@ -1,11 +1,16 @@
+from pathlib import Path
+
 from cryptography.fernet import Fernet
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_BASE_DIR = Path(__file__).resolve().parent.parent
+_ENV_FILE = str(_BASE_DIR / ".env")
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(_ENV_FILE, ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -21,11 +26,31 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_ID: str = ""
     GOOGLE_CLIENT_SECRET: str = ""
     GOOGLE_WORKSPACE_DOMAINS: list[str] | str = []
+    GOOGLE_REDIRECT_URI: str | None = None
+
+    @property
+    def google_redirect_uri(self) -> str:
+        if self.GOOGLE_REDIRECT_URI:
+            return self.GOOGLE_REDIRECT_URI
+        return f"{self.PUBLIC_BASE_URL.rstrip('/')}/oauth/google/callback"
 
     # Telegram Bot
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_BOT_USERNAME: str = ""
     TELEGRAM_WEBHOOK_SECRET: str = ""
+    ODOO_EMPLOYEE_TELEGRAM_ID_FIELD: str = ""
+    TELEGRAM_WEB_CLIENT_ID: str = ""
+    TELEGRAM_WEB_CLIENT_SECRET: str = ""
+    TELEGRAM_WEB_BASE_URL: str = ""
+
+    @property
+    def telegram_web_configured(self) -> bool:
+        return bool(
+            self.ODOO_EMPLOYEE_TELEGRAM_ID_FIELD
+            and self.TELEGRAM_WEB_CLIENT_ID
+            and self.TELEGRAM_WEB_CLIENT_SECRET
+            and self.ENCRYPTION_KEY
+        )
 
     # AI Agent Integration
     ENABLE_AI_AGENT_FORWARDING: bool = False

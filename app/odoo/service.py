@@ -108,6 +108,22 @@ class OdooService:
             "manager_name": None,
         }
 
+    def get_employee_telegram_id(self, uid: int, secret: str, field: str) -> int | None:
+        records = self.client.execute(
+            uid=uid, secret=secret, model="hr.employee", method="search_read",
+            args=[[("user_id", "=", uid)]],
+            kwargs={"fields": [field], "limit": 2},
+        )
+        if not isinstance(records, list) or len(records) != 1:
+            return None
+        value = records[0].get(field)
+        if isinstance(value, str):
+            value = value.strip()
+            if not value.isascii() or not value.isdecimal() or len(value) > 16:
+                return None
+            value = int(value)
+        return value if type(value) is int and 0 < value < 2**52 else None
+
     def compute_permissions(
         self,
         uid: int,
@@ -116,13 +132,28 @@ class OdooService:
         google_status: str = "disconnected",
         google_scopes: list[str] | None = None,
     ) -> list[str]:
-        """Tính toán danh sách 9 quyền hạn chuẩn hóa dựa trên trạng thái thực tế."""
+        """Tính toán danh sách quyền hạn chuẩn hóa dựa trên trạng thái thực tế."""
         perms: set[str] = set()
 
         # 1. Công việc cá nhân (tasks): cấp cho người dùng Odoo nội bộ đang hoạt động
         if is_internal_user:
             perms.add("tasks.read")
             perms.add("tasks.write")
+
+        if secret and is_internal_user:
+            try:
+                if self.client.execute(
+                    uid=uid, secret=secret, model="res.users", method="has_group",
+                    args=["base.group_user"],
+                ):
+                    perms.add("knowledge.read")
+                    if self.client.execute(
+                        uid=uid, secret=secret, model="res.users", method="has_group",
+                        args=["base.group_system"],
+                    ):
+                        perms.add("knowledge.write")
+            except Exception:
+                pass
 
         # 2. CRM: xác định quyền model thực tế trên crm.lead, cô lập từng thao tác
         if secret:
