@@ -1,47 +1,66 @@
+import enum
 import ssl
 import threading
 import xmlrpc.client
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import httpx
 from app.workspace.network_slots import outbound_slot, outbound_user_id
 
 
+class OdooErrorCode(str, enum.Enum):
+    AUTH_FAILED = "AUTH_FAILED"
+    ACCESS_DENIED = "ACCESS_DENIED"
+    INACTIVE_USER = "INACTIVE_USER"
+    EXTERNAL_USER = "EXTERNAL_USER"
+    INVALID_PARAMS = "INVALID_PARAMS"
+    NETWORK_ERROR = "NETWORK_ERROR"
+    CONFLICT = "CONFLICT"
+    UNKNOWN_RESULT = "UNKNOWN_RESULT"
+
+
 class OdooError(Exception):
     """Base exception for Odoo errors."""
+    def __init__(self, message: str, error_code: OdooErrorCode = OdooErrorCode.UNKNOWN_RESULT, raw_error: Optional[Any] = None):
+        super().__init__(message)
+        self.message = message
+        self.error_code = error_code
+        self.raw_error = raw_error
 
+
+class OdooApiError(OdooError):
     pass
 
 
 class OdooAuthError(OdooError):
     """Raised when authentication fails."""
-
-    pass
+    def __init__(self, message: str, raw_error: Optional[Any] = None):
+        super().__init__(message, error_code=OdooErrorCode.AUTH_FAILED, raw_error=raw_error)
 
 
 class OdooAccessError(OdooError):
     """Raised when access is denied / permission error."""
-
-    pass
+    def __init__(self, message: str, error_code: OdooErrorCode = OdooErrorCode.ACCESS_DENIED, raw_error: Optional[Any] = None):
+        super().__init__(message, error_code=error_code, raw_error=raw_error)
 
 
 class OdooNetworkError(OdooError):
     """Raised on connection timeout or network failure."""
-
-    pass
+    def __init__(self, message: str, raw_error: Optional[Any] = None):
+        super().__init__(message, error_code=OdooErrorCode.NETWORK_ERROR, raw_error=raw_error)
 
 
 class OdooAccountInactiveError(OdooAccessError):
     """Raised when Odoo account is inactive (active=False)."""
-
-    pass
+    def __init__(self, message: str, raw_error: Optional[Any] = None):
+        super().__init__(message, error_code=OdooErrorCode.INACTIVE_USER, raw_error=raw_error)
 
 
 class OdooExternalUserError(OdooAccessError):
     """Raised when Odoo account is an external/portal user (share=True)."""
-
-    pass
+    def __init__(self, message: str, raw_error: Optional[Any] = None):
+        super().__init__(message, error_code=OdooErrorCode.EXTERNAL_USER, raw_error=raw_error)
 
 
 class TimeoutTransport(xmlrpc.client.SafeTransport):

@@ -17,8 +17,11 @@ logger = logging.getLogger(__name__)
 class GoogleErrorCode(str, enum.Enum):
     AUTH_EXPIRED = "AUTH_EXPIRED"
     RECONNECT_REQUIRED = "RECONNECT_REQUIRED"
+    MISSING_SCOPE = "MISSING_SCOPE"
     PERMISSION_DENIED = "PERMISSION_DENIED"
     QUOTA_EXCEEDED = "QUOTA_EXCEEDED"
+    SERVICE_DISABLED = "SERVICE_DISABLED"
+    INVALID_ARGUMENT = "INVALID_ARGUMENT"
     NOT_FOUND = "NOT_FOUND"
     CONFLICT = "CONFLICT"
     RATE_LIMIT = "RATE_LIMIT"
@@ -70,8 +73,10 @@ class UnifiedGoogleClient:
         max_user_reads: int = 2,
         max_user_writes: int = 1,
         http_client: Optional[httpx.AsyncClient] = None,
+        circuit_breaker: Optional[Any] = None,
     ):
         self.oauth_service = oauth_service
+        self.circuit_breaker = circuit_breaker
         self.global_semaphore = asyncio.Semaphore(max_global_concurrency)
         self.max_user_reads = max_user_reads
         self.max_user_writes = max_user_writes
@@ -114,7 +119,25 @@ class UnifiedGoogleClient:
         content: Optional[bytes] = None,
         is_write: bool = False,
         timeout: float = 120.0,
+        service: Optional[str] = None,
     ) -> Any:
+        # Determine service from url if not provided
+        svc = service or "google_general"
+        if not service:
+            for s in ("calendar", "gmail", "drive", "docs", "sheets", "slides"):
+                if s in url:
+                    svc = s
+                    break
+
+        # Check circuit breaker
+        if self.circuit_breaker and not self.circuit_breaker.is_available(user_id, svc):
+            raise GoogleApiError(
+                error_code=GoogleErrorCode.SERVICE_TEMPORARY,
+                message=f"Circuit breaker tripped for {svc} on account {user_id}. Calls temporarily paused to avoid cascading failures.",
+                status_code=503,
+                retryable=False,
+            )
+
         user_sem = self._get_user_semaphore(user_id, is_write)
         max_attempts = 1 if is_write else 3
         attempt = 0
@@ -146,6 +169,8 @@ class UnifiedGoogleClient:
                     try:
                         resp = await self._http_client.send(req)
                     except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                        if self.circuit_breaker:
+                            self.circuit_breaker.record_failure(user_id, svc)
                         if is_write:
                             raise GoogleApiError(
                                 error_code=GoogleErrorCode.UNKNOWN_RESULT,
@@ -172,6 +197,8 @@ class UnifiedGoogleClient:
                             refreshed_on_401 = True
                             # Thử lại ngay lập tức với token mới
                             continue
+                        if self.circuit_breaker:
+                            self.circuit_breaker.record_failure(user_id, svc)
                         raise GoogleApiError(
                             error_code=GoogleErrorCode.AUTH_EXPIRED,
                             message="Phiên xác thực Google đã hết hạn hoặc bị thu hồi. Vui lòng kết nối lại trên Portal.",
@@ -182,6 +209,8 @@ class UnifiedGoogleClient:
 
                     # 2. Xử lý 429 Rate Limit hoặc 5xx Server Error
                     if resp.status_code == 429 or resp.status_code >= 500:
+                        if self.circuit_breaker:
+                            self.circuit_breaker.record_failure(user_id, svc)
                         if is_write:
                             err_code = GoogleErrorCode.UNKNOWN_RESULT if resp.status_code >= 500 else GoogleErrorCode.RATE_LIMIT
                             raise GoogleApiError(
@@ -209,12 +238,26 @@ class UnifiedGoogleClient:
                             raw_error=resp.text,
                         )
 
-                    # 3. Xử lý 403 Forbidden / Quota Exceeded
+                    # 3. Xử lý 403 Forbidden / Quota Exceeded / Missing Scope / Disabled Service
                     if resp.status_code == 403:
                         err_text = resp.text.lower()
                         is_quota = "quota" in err_text or "ratelimitexceeded" in err_text
-                        err_code = GoogleErrorCode.QUOTA_EXCEEDED if is_quota else GoogleErrorCode.PERMISSION_DENIED
-                        msg = "Tài khoản Google đã vượt hạn mức quota." if is_quota else "Chưa được cấp quyền truy cập tài nguyên Google này."
+                        is_scope = "insufficient" in err_text or "scope" in err_text
+                        is_disabled = "disabled" in err_text or "has not been used in project" in err_text
+                        
+                        if is_quota:
+                            err_code = GoogleErrorCode.QUOTA_EXCEEDED
+                            msg = "Tài khoản Google đã vượt hạn mức quota."
+                        elif is_scope:
+                            err_code = GoogleErrorCode.MISSING_SCOPE
+                            msg = "Tài khoản Google chưa được cấp đủ scope quyền truy cập cho thao tác này."
+                        elif is_disabled:
+                            err_code = GoogleErrorCode.SERVICE_DISABLED
+                            msg = "Dịch vụ Google API tương ứng chưa được kích hoạt trên dự án Google Cloud."
+                        else:
+                            err_code = GoogleErrorCode.PERMISSION_DENIED
+                            msg = "Chưa được cấp quyền truy cập tài nguyên Google này."
+
                         raise GoogleApiError(
                             error_code=err_code,
                             message=msg,
