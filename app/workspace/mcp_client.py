@@ -96,6 +96,39 @@ class MCPStreamableClient:
         result = data.get("result", {})
         return result.get("serverInfo", result)
 
+    async def list_tools(
+        self,
+        token: str,
+        user_id: int,
+        connection_version: int,
+    ) -> list[Dict[str, Any]]:
+        """List available tools exposed by this MCP server."""
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "X-User-ID": str(user_id),
+            "X-Connection-Version": str(connection_version),
+        }
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {},
+        }
+        resp = await self._http_client.send(
+            httpx.Request("POST", self.base_url, headers=headers, json=payload)
+        )
+        if resp.status_code >= 400:
+            raise MCPError(f"tools/list failed with status {resp.status_code}", status_code=resp.status_code)
+        
+        data = resp.json()
+        if "error" in data:
+            raise MCPError(f"MCP tools/list Error: {data['error']}", data=data["error"])
+        
+        result = data.get("result", {})
+        return result.get("tools", [])
+
     async def call_tool(
         self,
         token: str,
