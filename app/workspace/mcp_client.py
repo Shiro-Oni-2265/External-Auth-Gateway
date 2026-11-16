@@ -206,3 +206,184 @@ class MCPStreamableClient:
     async def close(self) -> None:
         await self._http_client.aclose()
 
+
+class MCPSyncClient:
+    """Synchronous Streamable HTTP client for Google Workspace MCP services with session persistence."""
+
+    def __init__(
+        self,
+        service: str,
+        base_url: Optional[str] = None,
+        http_client: Optional[httpx.Client] = None,
+        transport: Optional[Any] = None,
+    ):
+        self.service = service
+        self.base_url = base_url or ENDPOINTS.get(service, f"https://{service}mcp.googleapis.com/mcp/v1")
+        self.session_id: Optional[str] = None
+        self._shared_client = http_client or httpx.Client(
+            http2=True,
+            timeout=httpx.Timeout(9.0, connect=3.0, pool=2.0),
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+            transport=transport,
+        )
+        self._owns_client = http_client is None
+
+    def initialize(self, token: str, user_id: int, connection_version: int = 1) -> Dict[str, Any]:
+        """Perform MCP initialize handshake and capture Mcp-Session-Id."""
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "X-User-ID": str(user_id),
+            "X-Connection-Version": str(connection_version),
+        }
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"tools": {"listChanged": True}},
+                "clientInfo": {"name": "odoo-auth-gateway", "version": "1.0"},
+            },
+        }
+        resp = self._shared_client.post(self.base_url, headers=headers, json=payload)
+        if resp.status_code >= 400:
+            raise MCPError(f"Initialize failed with status {resp.status_code}", status_code=resp.status_code)
+        sess_hdr = resp.headers.get("Mcp-Session-Id") or resp.headers.get("mcp-session-id")
+        if sess_hdr:
+            self.session_id = sess_hdr
+        data = resp.json()
+        if "error" in data:
+            raise MCPError(f"MCP Initialize Error: {data['error']}", data=data["error"])
+        result = data.get("result", {})
+        return result.get("serverInfo", result)
+
+    def list_tools(self, token: str, user_id: int, connection_version: int = 1) -> list[Dict[str, Any]]:
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "X-User-ID": str(user_id),
+            "X-Connection-Version": str(connection_version),
+        }
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+
+        payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+        resp = self._shared_client.post(self.base_url, headers=headers, json=payload)
+        if resp.status_code >= 400:
+            raise MCPError(f"tools/list failed with status {resp.status_code}", status_code=resp.status_code)
+        data = resp.json()
+        if "error" in data:
+            raise MCPError(f"MCP tools/list Error: {data['error']}", data=data["error"])
+        result = data.get("result", {})
+        return result.get("tools", [])
+
+    def call_tool(
+        self,
+        token: str,
+        name: str,
+        arguments: Dict[str, Any],
+        user_id: Optional[int] = None,
+        connection_version: int = 1,
+    ) -> Dict[str, Any]:
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if user_id is not None:
+            headers["X-User-ID"] = str(user_id)
+            headers["X-Connection-Version"] = str(connection_version)
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        }
+        try:
+            with self._shared_client.stream("POST", self.base_url, headers=headers, json=payload) as response:
+                if response.status_code != 200:
+                    raise MCPError(f"Tool call failed with status {response.status_code}", status_code=response.status_code)
+
+                # Capture or refresh session id
+                sess_hdr = response.headers.get("Mcp-Session-Id") or response.headers.get("mcp-session-id")
+                if sess_hdr:
+                    self.session_id = sess_hdr
+
+                content_type = response.headers.get("content-type", "")
+                if "text/event-stream" in content_type:
+                    message = self._parse_sse_response(response.iter_text())
+                else:
+                    raw = bytearray()
+                    for chunk in response.iter_bytes():
+                        raw.extend(chunk)
+                        if len(raw) > 8 * 1024 * 1024:
+                            raise MCPError("Response exceeds 8 MiB")
+                    message = json.loads(raw)
+
+            if message.get("id") != 1 or "error" in message:
+                raise MCPError("MCP call returned error", data=message.get("error"))
+            result = message.get("result", {})
+            if result.get("isError"):
+                raise MCPError("Tool returned error status", data=result)
+
+            data = result.get("structuredContent")
+            if data is None:
+                blocks = result.get("content", [])
+                if len(blocks) == 1 and blocks[0].get("type") == "text":
+                    data = json.loads(blocks[0]["text"])
+                else:
+                    data = result
+
+            if not isinstance(data, dict):
+                return data
+
+            # Format tool response matching catalog contracts
+            if name in {"read_doc", "read_presentation"}:
+                return data.get("content", data)
+            if name == "get_file_metadata":
+                return self._drive_file(data)
+            if name == "search_files":
+                return {**data, "files": [self._drive_file(item) for item in data.get("files", [])]}
+            if name == "list_events":
+                return {**data, "items": data.get("events", [])}
+            return data
+        except (httpx.RequestError, ValueError, KeyError, TypeError) as exc:
+            if isinstance(exc, MCPError):
+                raise
+            raise MCPError("MCP request failed") from exc
+
+    def _parse_sse_response(self, chunks):
+        buffer = ""
+        received = 0
+        for chunk in chunks:
+            received += len(chunk.encode())
+            if received > 8 * 1024 * 1024:
+                raise MCPError("Response exceeds 8 MiB")
+            events = (buffer + chunk).replace("\r\n", "\n").split("\n\n")
+            buffer = events.pop()
+            for event in events:
+                data = "\n".join(line[5:].lstrip(" ") for line in event.splitlines() if line.startswith("data:"))
+                if data:
+                    message = json.loads(data)
+                    if isinstance(message, dict) and message.get("id") == 1:
+                        return message
+        raise MCPError("No valid SSE response received")
+
+    @staticmethod
+    def _drive_file(data):
+        names = {"title": "name", "viewUrl": "webViewLink", "fileSize": "size"}
+        return {names.get(key, key): value for key, value in data.items()}
+
+    def close(self) -> None:
+        if self._owns_client and not self._shared_client.is_closed:
+            self._shared_client.close()
+

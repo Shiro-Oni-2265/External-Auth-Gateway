@@ -56,8 +56,13 @@ class DistributedOAuthLeaseManager:
             if not force_refresh and ensure_utc(conn.expires_at) > now + timedelta(minutes=5):
                 return self.oauth_service._decrypt(conn.encrypted_access_token)
 
-        # 2. Acquire Lease
-        max_wait_seconds = 10.0
+            expected_connection_version = getattr(conn, "connection_version", 1)
+            expected_sub = conn.google_sub
+            expected_refresh_token = conn.encrypted_refresh_token
+            initial_token = conn.encrypted_access_token
+
+        # 2. Acquire Lease with atomic conditional update
+        max_wait_seconds = 15.0
         start_wait = asyncio.get_event_loop().time()
         
         while True:
@@ -69,40 +74,85 @@ class DistributedOAuthLeaseManager:
                 if not lease:
                     lease = OAuthRefreshLease(
                         user_id=user_id,
-                        lease_holder=self.worker_id,
-                        lease_expires_at=now + timedelta(seconds=self.lease_seconds),
+                        lease_holder=None,
+                        lease_expires_at=None,
                         connection_version=1,
                     )
                     db.add(lease)
                     try:
                         db.commit()
-                        lease_acquired = True
                     except Exception:
                         db.rollback()
-                else:
-                    if lease.lease_expires_at is None or ensure_utc(lease.lease_expires_at) <= now or lease.lease_holder == self.worker_id:
-                        lease.lease_holder = self.worker_id
-                        lease.lease_expires_at = now + timedelta(seconds=self.lease_seconds)
-                        db.commit()
-                        lease_acquired = True
+
+                # Atomic conditional UPDATE: only exactly 1 worker can acquire
+                stmt = (
+                    update(OAuthRefreshLease)
+                    .where(
+                        OAuthRefreshLease.user_id == user_id,
+                        (OAuthRefreshLease.lease_holder.is_(None))
+                        | (OAuthRefreshLease.lease_expires_at <= now)
+                        | (OAuthRefreshLease.lease_holder == self.worker_id),
+                    )
+                    .values(
+                        lease_holder=self.worker_id,
+                        lease_expires_at=now + timedelta(seconds=self.lease_seconds),
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                res = db.execute(stmt)
+                db.commit()
+                if res.rowcount == 1:
+                    lease_acquired = True
 
             if lease_acquired:
                 break
 
             # Another worker is refreshing: wait and poll
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.1)
             
             # Check if refreshed by the other worker
             with self.oauth_service.session_factory() as db:
                 conn = db.query(GoogleConnection).filter_by(user_id=user_id).first()
-                if conn and ensure_utc(conn.expires_at) > datetime.now(UTC) + timedelta(minutes=5) and not force_refresh:
-                    return self.oauth_service._decrypt(conn.encrypted_access_token)
+                lease = db.query(OAuthRefreshLease).filter_by(user_id=user_id).first()
+                if conn and lease:
+                    curr_version = getattr(conn, "connection_version", 1)
+                    if (
+                        curr_version > expected_connection_version
+                        or (conn.encrypted_access_token != initial_token and ensure_utc(conn.expires_at) > datetime.now(UTC) + timedelta(minutes=5))
+                        or (not force_refresh and ensure_utc(conn.expires_at) > datetime.now(UTC) + timedelta(minutes=5))
+                    ):
+                        return self.oauth_service._decrypt(conn.encrypted_access_token)
 
             if asyncio.get_event_loop().time() - start_wait > max_wait_seconds:
                 logger.warning("Timed out waiting for another worker's OAuth lease; attempting override.")
                 break
 
-        # 3. Perform the actual refresh under lease
+        # 3. Before dispatching network refresh, check if token was ALREADY refreshed while waiting
+        with self.oauth_service.session_factory() as db:
+            conn = db.query(GoogleConnection).filter_by(user_id=user_id).first()
+            if conn and (
+                getattr(conn, "connection_version", 1) > expected_connection_version
+                or (conn.encrypted_access_token != initial_token and ensure_utc(conn.expires_at) > datetime.now(UTC) + timedelta(minutes=5))
+            ):
+                # Another worker completed the refresh while we were waiting!
+                # Release our newly claimed lease and return the refreshed token.
+                stmt = (
+                    update(OAuthRefreshLease)
+                    .where(
+                        OAuthRefreshLease.user_id == user_id,
+                        OAuthRefreshLease.lease_holder == self.worker_id,
+                    )
+                    .values(
+                        lease_holder=None,
+                        lease_expires_at=None,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                db.execute(stmt)
+                db.commit()
+                return self.oauth_service._decrypt(conn.encrypted_access_token)
+
+        # 4. Perform the actual refresh under lease
         try:
             if hasattr(self.oauth_service, "_perform_network_refresh"):
                 new_token, expires_in = self.oauth_service._perform_network_refresh(user_id)
@@ -113,34 +163,54 @@ class DistributedOAuthLeaseManager:
 
             with self.oauth_service.session_factory() as db:
                 conn = db.query(GoogleConnection).filter_by(user_id=user_id).first()
+                lease = db.query(OAuthRefreshLease).filter_by(user_id=user_id).first()
+                if lease and lease.lease_holder == self.worker_id:
+                    lease.lease_holder = None
+                    lease.lease_expires_at = None
+                    lease.connection_version += 1
+
                 if not conn or conn.status != "connected":
-                    lease = db.query(OAuthRefreshLease).filter_by(user_id=user_id).first()
-                    if lease:
-                        lease.lease_holder = None
-                        lease.lease_expires_at = None
                     db.commit()
                     from app.google.oauth import GoogleAuthRevokedError
                     raise GoogleAuthRevokedError("Connection was disconnected or revoked during token refresh.")
 
+                # Check if connection was relinked or changed during in-flight refresh
+                curr_version = getattr(conn, "connection_version", 1)
+                if (
+                    curr_version != expected_connection_version
+                    or conn.google_sub != expected_sub
+                    or conn.encrypted_refresh_token != expected_refresh_token
+                ):
+                    logger.warning(
+                        "GoogleConnection changed (version %s != %s or sub changed) during in-flight refresh. Discarding stale tokens.",
+                        expected_connection_version, curr_version
+                    )
+                    db.commit()
+                    return self.oauth_service._decrypt(conn.encrypted_access_token)
+
                 conn.encrypted_access_token = self.oauth_service._encrypt(new_token)
                 conn.expires_at = datetime.now(UTC) + timedelta(seconds=expires_in)
                 conn.status = "connected"
-                    
-                lease = db.query(OAuthRefreshLease).filter_by(user_id=user_id).first()
-                if lease:
-                    lease.lease_holder = None
-                    lease.lease_expires_at = None
-                    lease.connection_version += 1
+                conn.connection_version = curr_version + 1
                 db.commit()
             return new_token
         except Exception:
             # Release lease on failure
             with self.oauth_service.session_factory() as db:
-                lease = db.query(OAuthRefreshLease).filter_by(user_id=user_id).first()
-                if lease and lease.lease_holder == self.worker_id:
-                    lease.lease_holder = None
-                    lease.lease_expires_at = None
-                    db.commit()
+                stmt = (
+                    update(OAuthRefreshLease)
+                    .where(
+                        OAuthRefreshLease.user_id == user_id,
+                        OAuthRefreshLease.lease_holder == self.worker_id,
+                    )
+                    .values(
+                        lease_holder=None,
+                        lease_expires_at=None,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                db.execute(stmt)
+                db.commit()
             raise
 
     async def refresh_active_expiring_tokens(

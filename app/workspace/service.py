@@ -39,16 +39,43 @@ class WorkspaceService:
         self.circuit_breaker = circuit_breaker or AccountServiceCircuitBreaker()
         self.router = router or ProtocolRouter(circuit_breaker=self.circuit_breaker, mcp_enabled=use_mcp)
         self.use_mcp = use_mcp
-        # Persistent HTTP client pool for REST calls (connect_timeout 3s, pool_timeout 2s)
-        self._shared_client = http_client or (
-            getattr(google_client, "unified_client", None)._http_client
-            if getattr(google_client, "unified_client", None)
-            else httpx.Client(
+        
+        # Persistent synchronous HTTP connection pool (connect_timeout 3s, pool_timeout 2s, HTTP/2)
+        if isinstance(http_client, httpx.Client):
+            self._shared_client = http_client
+            self._owns_client = False
+        elif transport is not None:
+            self._shared_client = httpx.Client(
                 timeout=httpx.Timeout(9.0, connect=3.0, pool=2.0),
                 limits=httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=30.0),
                 transport=transport,
             )
-        )
+            self._owns_client = True
+        elif getattr(google_client, "_http_pool", None) and isinstance(google_client._http_pool, httpx.Client):
+            self._shared_client = google_client._http_pool
+            self._owns_client = False
+        else:
+            self._shared_client = httpx.Client(
+                http2=True,
+                timeout=httpx.Timeout(9.0, connect=3.0, pool=2.0),
+                limits=httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=30.0),
+            )
+            self._owns_client = True
+
+        self._mcp_clients = {}
+
+    def get_mcp_client(self, service: str):
+        if service not in self._mcp_clients:
+            from app.workspace.mcp_client import MCPSyncClient
+            self._mcp_clients[service] = MCPSyncClient(
+                service=service,
+                http_client=self._shared_client,
+            )
+        return self._mcp_clients[service]
+
+    def close(self):
+        if getattr(self, "_owns_client", False) and hasattr(self, "_shared_client") and not self._shared_client.is_closed:
+            self._shared_client.close()
 
     @property
     def use_mcp(self):
@@ -136,15 +163,25 @@ class WorkspaceService:
             mcp_call = translate(service, method, params, body, media)
             if mcp_call:
                 token = self.google.oauth_service.get_valid_access_token(user_id)
+                mcp_client = self.get_mcp_client(service)
+                connection = self.google.get_user_google_connection(user_id)
+                conn_ver = getattr(connection, "connection_version", 1) if connection else 1
                 try:
                     with outbound_slot(user_id, write=spec["kind"] == "write"), measure_stage("external_call_ms", protocol="mcp"):
-                        result = call_tool(service, token, *mcp_call, transport=self.transport)
+                        result = mcp_client.call_tool(
+                            token=token,
+                            name=mcp_call[0],
+                            arguments=mcp_call[1],
+                            user_id=user_id,
+                            connection_version=conn_ver,
+                        )
                         self.circuit_breaker.record_success(user_id, service)
                         return result
-                except GoogleMcpError as exc:
+                except Exception as exc:
                     self.circuit_breaker.record_failure(user_id, service)
+                    status_code = getattr(exc, "status_code", None)
                     code = {401: "RECONNECT_REQUIRED", 403: "PERMISSION_DENIED", 429: "RATE_LIMIT"}.get(
-                        exc.status_code, "UNKNOWN_RESULT" if spec["kind"] == "write" else "SERVICE_ERROR"
+                        status_code, "UNKNOWN_RESULT" if spec["kind"] == "write" else "SERVICE_ERROR"
                     )
                     raise WorkspaceError(code, "Google Workspace MCP không trả kết quả thành công.") from exc
         url = build_url(service, spec, params, upload=media is not None)
@@ -165,34 +202,25 @@ class WorkspaceService:
         elif body or "request" in spec:
             kwargs["json"] = body
         try:
-            client = self._shared_client if isinstance(self._shared_client, httpx.Client) else httpx.Client(
-                timeout=httpx.Timeout(9.0, connect=3.0, pool=2.0),
-                limits=httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=30.0),
-                transport=self.transport,
-            )
-            should_close = client is not self._shared_client
-            try:
-                with outbound_slot(user_id, write=spec["kind"] == "write"), measure_stage("external_call_ms", protocol="rest"), client.stream(spec["httpMethod"], url, **kwargs) as response:
-                    raw = bytearray()
-                    for chunk in response.iter_bytes():
-                        raw.extend(chunk)
-                        if len(raw) > MAX_MEDIA_BYTES:
-                            raise WorkspaceError("UNKNOWN_RESULT" if spec["kind"] == "write" else "RESPONSE_TOO_LARGE", "Kết quả vượt 8 MiB. Chọn phạm vi nhỏ hơn hoặc tải trực tiếp trên Google.")
-                    if response.status_code >= 500:
-                        code = "UNKNOWN_RESULT" if spec["kind"] == "write" else "SERVICE_ERROR"
-                        raise WorkspaceError(code, f"Google tạm thời lỗi ({response.status_code}); không tự gửi lại thao tác ghi.")
-                    if response.status_code >= 300:
-                        codes = {401: "RECONNECT_REQUIRED", 403: "PERMISSION_DENIED", 404: "NOT_FOUND", 409: "CONFLICT", 412: "CONFLICT", 429: "RATE_LIMIT"}
-                        raise WorkspaceError(codes.get(response.status_code, "SERVICE_ERROR"), f"Google trả HTTP {response.status_code}. Kiểm tra API đã bật, quyền tài khoản và thông tin yêu cầu.")
-                    if not raw:
-                        return {}
-                    download = params.get("alt") == "media" or (spec.get("supportsMediaDownload") and "response" not in spec)
-                    if not download and "json" in response.headers.get("content-type", ""):
-                        return json.loads(raw)
-                    return {"content_base64": base64.b64encode(raw).decode(), "mime_type": response.headers.get("content-type", "application/octet-stream"), "size_bytes": len(raw)}
-            finally:
-                if should_close:
-                    client.close()
+            client = self._shared_client
+            with outbound_slot(user_id, write=spec["kind"] == "write"), measure_stage("external_call_ms", protocol="rest"), client.stream(spec["httpMethod"], url, **kwargs) as response:
+                raw = bytearray()
+                for chunk in response.iter_bytes():
+                    raw.extend(chunk)
+                    if len(raw) > MAX_MEDIA_BYTES:
+                        raise WorkspaceError("UNKNOWN_RESULT" if spec["kind"] == "write" else "RESPONSE_TOO_LARGE", "Kết quả vượt 8 MiB. Chọn phạm vi nhỏ hơn hoặc tải trực tiếp trên Google.")
+                if response.status_code >= 500:
+                    code = "UNKNOWN_RESULT" if spec["kind"] == "write" else "SERVICE_ERROR"
+                    raise WorkspaceError(code, f"Google tạm thời lỗi ({response.status_code}); không tự gửi lại thao tác ghi.")
+                if response.status_code >= 300:
+                    codes = {401: "RECONNECT_REQUIRED", 403: "PERMISSION_DENIED", 404: "NOT_FOUND", 409: "CONFLICT", 412: "CONFLICT", 429: "RATE_LIMIT"}
+                    raise WorkspaceError(codes.get(response.status_code, "SERVICE_ERROR"), f"Google trả HTTP {response.status_code}. Kiểm tra API đã bật, quyền tài khoản và thông tin yêu cầu.")
+                if not raw:
+                    return {}
+                download = params.get("alt") == "media" or (spec.get("supportsMediaDownload") and "response" not in spec)
+                if not download and "json" in response.headers.get("content-type", ""):
+                    return json.loads(raw)
+                return {"content_base64": base64.b64encode(raw).decode(), "mime_type": response.headers.get("content-type", "application/octet-stream"), "size_bytes": len(raw)}
         except (httpx.RequestError, json.JSONDecodeError) as exc:
             code = "UNKNOWN_RESULT" if spec["kind"] == "write" else "SERVICE_ERROR"
             raise WorkspaceError(code, "Kết nối Google gián đoạn; chưa rõ kết quả thao tác ghi." if code == "UNKNOWN_RESULT" else "Không thể kết nối Google.") from exc

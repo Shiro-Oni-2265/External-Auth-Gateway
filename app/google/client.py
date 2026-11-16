@@ -323,6 +323,16 @@ class GoogleClient:
     def __init__(self, oauth_service: GoogleOAuthService):
         self.oauth_service = oauth_service
         self.unified_client = UnifiedGoogleClient(oauth_service=oauth_service)
+        # Persistent synchronous HTTP connection pool with HTTP/2 and 3s connect, 2s pool timeouts
+        self._http_pool = httpx.Client(
+            http2=True,
+            timeout=httpx.Timeout(25.0, connect=3.0, pool=2.0),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=30.0),
+        )
+
+    def close(self):
+        if hasattr(self, "_http_pool") and not self._http_pool.is_closed:
+            self._http_pool.close()
 
     def _request(
         self,
@@ -339,7 +349,7 @@ class GoogleClient:
         req_headers["Authorization"] = f"Bearer {token}"
 
         with outbound_slot(user_id, write=method not in {"GET", "HEAD"}):
-            resp = httpx.request(
+            resp = self._http_pool.request(
                 method, url, params=params, json=json_data, headers=req_headers, timeout=25.0
             )
 
@@ -350,7 +360,7 @@ class GoogleClient:
                 token = self.oauth_service.get_valid_access_token(user_id, force_refresh=True)
                 req_headers["Authorization"] = f"Bearer {token}"
                 with outbound_slot(user_id, write=method not in {"GET", "HEAD"}):
-                    resp = httpx.request(
+                    resp = self._http_pool.request(
                         method, url, params=params, json=json_data, headers=req_headers, timeout=25.0
                     )
             except Exception:
