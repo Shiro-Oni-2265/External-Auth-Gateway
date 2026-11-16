@@ -224,6 +224,23 @@ def get_workspace_job(user_id: int, job_id: str, request: Request):
         job = db.query(WorkspaceJob).filter_by(job_id=job_id, user_id=user_id).first()
         if not job:
             raise HTTPException(404, detail="Workspace job not found")
+        if job.status == WorkspaceJobStatus.UNKNOWN_RESULT.value and job.operation_id:
+            from app.workspace.models import WorkspaceIdempotencyRecord
+
+            evidence = db.query(WorkspaceIdempotencyRecord).filter_by(
+                user_id=user_id, operation_id=job.operation_id, status="completed",
+            ).first()
+            original_payload = _decrypt_payload(job.payload_encrypted, key)
+            if (evidence and evidence.response_json and isinstance(original_payload, dict)
+                    and evidence.payload_hash == compute_payload_hash(original_payload)):
+                confirmed_result = json.loads(evidence.response_json)
+                job.status = WorkspaceJobStatus.COMPLETED.value
+                job.result_encrypted = _encrypt_payload(confirmed_result, key)
+                job.error_code = None
+                job.error_message = None
+                job.callback_delivered_at = None
+                job.callback_retry_at = datetime.now(UTC)
+                db.commit()
         result = _decrypt_payload(job.result_encrypted, key) if job.result_encrypted else None
         return {
             "status": job.status,

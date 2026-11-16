@@ -142,3 +142,43 @@ class DistributedOAuthLeaseManager:
                     lease.lease_expires_at = None
                     db.commit()
             raise
+
+    async def refresh_active_expiring_tokens(
+        self,
+        max_activity_minutes: int = 30,
+        expiry_window_minutes: int = 5,
+    ) -> list[int]:
+        """Proactively refresh tokens for users whose tokens expire soon AND who were active recently.
+        
+        - Filters users who had activity within `max_activity_minutes`.
+        - Identifies tokens expiring within `expiry_window_minutes`.
+        - Calls `get_valid_token(uid, force_refresh=True)` safely under distributed lease.
+        """
+        now = datetime.now(UTC)
+        activity_threshold = now - timedelta(minutes=max_activity_minutes)
+        expiry_threshold = now + timedelta(minutes=expiry_window_minutes)
+
+        candidates = []
+        with self.oauth_service.session_factory() as db:
+            from app.models import User
+            # Active connections expiring soon for users active recently
+            query = (
+                db.query(GoogleConnection.user_id)
+                .join(User, User.id == GoogleConnection.user_id)
+                .filter(
+                    GoogleConnection.status == "connected",
+                    GoogleConnection.expires_at <= expiry_threshold,
+                    (User.updated_at >= activity_threshold) | (GoogleConnection.updated_at >= activity_threshold),
+                )
+            )
+            candidates = [row[0] for row in query.all()]
+
+        refreshed_users = []
+        for uid in candidates:
+            try:
+                await self.get_valid_token(uid, force_refresh=True)
+                refreshed_users.append(uid)
+            except Exception as exc:
+                logger.warning(f"Failed proactive token refresh for user {uid}: {exc}")
+
+        return refreshed_users

@@ -10,6 +10,7 @@ from sqlalchemy import text
 
 
 network_slots: ContextVar[object | None] = ContextVar("workspace_network_slots", default=None)
+before_write: ContextVar = ContextVar("workspace_before_write", default=None)
 outbound_user_id: ContextVar[int | None] = ContextVar("workspace_outbound_user", default=None)
 
 
@@ -69,8 +70,13 @@ class NetworkSlots:
 @contextmanager
 def outbound_slot(user_id, *, write=False):
     limiter = network_slots.get()
+    guard = before_write.get() if write else None
     if limiter is None or user_id is None:
+        if guard:
+            guard()
         yield
     else:
         with limiter.acquire(user_id, write):
+            if guard:
+                guard()
             yield

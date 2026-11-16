@@ -148,6 +148,16 @@ class WorkspaceWorker:
             ).filter(WorkspaceJob.lease_expires_at > now).with_for_update().first()
             if job is None:
                 return False
+            if status == WorkspaceJobStatus.UNKNOWN_RESULT.value and job.operation_id:
+                from app.workspace.idempotency import IdempotencyManager, compute_payload_hash
+
+                evidence = IdempotencyManager().get_record(db, job.operation_id)
+                payload = _decrypt_data(job.payload_encrypted, key)
+                if (evidence and evidence.status == "completed" and evidence.user_id == job.user_id
+                        and evidence.payload_hash == compute_payload_hash(payload) and evidence.response_json):
+                    status = WorkspaceJobStatus.COMPLETED.value
+                    result = json.loads(evidence.response_json)
+                    error = None
             job.status = status
             job.completed_at = now
             job.result_encrypted = _encrypt_data(result, key)
@@ -177,7 +187,7 @@ class WorkspaceWorker:
             db.commit()
         if await self.send_callback(job, _decrypt_data(job.result_encrypted, key)):
             with self.session_factory() as db:
-                db.query(WorkspaceJob).filter_by(job_id=job_id).update({
+                db.query(WorkspaceJob).filter_by(job_id=job_id, status=job.status).update({
                     "callback_delivered_at": datetime.now(UTC), "callback_retry_at": None,
                 })
                 db.commit()
@@ -239,6 +249,22 @@ class WorkspaceWorker:
             result = await asyncio.to_thread(drive_documents, workspace_svc, user_id, [], file_id)
             return {"status": "completed", "result": result}
 
+        if action == "read" and service == "drive" and operation == "knowledge.search":
+            from app.workspace.drive_knowledge import FILE_ID, drive_documents
+
+            terms = req_values["parameters"].get("terms", [])
+            file_id = req_values["parameters"].get("file_id")
+            question = req_values["body"].get("question")
+            if (not isinstance(question, str) or not question.strip() or len(question) > 12000
+                    or not isinstance(terms, list) or len(terms) > 8
+                    or any(not isinstance(term, str) or len(term) > 80 for term in terms)
+                    or (file_id is not None and (not isinstance(file_id, str) or not FILE_ID.fullmatch(file_id)))):
+                raise WorkspaceError("INVALID_REQUEST", "Yêu cầu tìm tài liệu không hợp lệ.")
+            workspace_svc.use_mcp = False
+            result = await asyncio.to_thread(drive_documents, workspace_svc, user_id, terms, file_id)
+            result["question"] = question
+            return {"status": "completed", "result": result}
+
         if action == "prepare":
             # PREPARE: Generates preview and signed _ticket, emits 0 mutation requests
             res = await asyncio.to_thread(workspace_svc.prepare, user_id, service, req_values)
@@ -264,11 +290,36 @@ class WorkspaceWorker:
             exec_payload = dict(req_values)
             exec_payload["_ticket"] = ticket
             # Run real mutation call
-            res = await asyncio.to_thread(workspace_svc.execute, user_id, service, exec_payload)
+            def execute_and_record():
+                # The thread can outlive the async deadline. Persist a confirmed response
+                # inside the thread so a later status check can reconcile it.
+                try:
+                    result = workspace_svc.execute(user_id, service, exec_payload)
+                except WorkspaceError as exc:
+                    if exc.code == "UNKNOWN_RESULT":
+                        with self.session_factory() as idemp_db:
+                            idemp_mgr.mark_unknown_result(idemp_db, op_id)
+                    raise
+                with self.session_factory() as idemp_db:
+                    resource_id = str(result.get("data", {}).get("id") or "")
+                    idemp_mgr.mark_completed(idemp_db, op_id, resource_id, result)
+                    # A timed-out worker may have already committed the unknown status.
+                    from app.workspace.telemetry import active_execution
 
-            with self.session_factory() as idemp_db:
-                res_id = str(res.get("data", {}).get("id") or "")
-                idemp_mgr.mark_completed(idemp_db, op_id, res_id, res)
+                    trace = active_execution.get()
+                    job_key = trace.job_id if trace else None
+                    if job_key:
+                        idemp_db.query(WorkspaceJob).filter_by(
+                            job_id=job_key, user_id=user_id, operation_id=op_id,
+                            status=WorkspaceJobStatus.UNKNOWN_RESULT.value,
+                        ).update({"status": WorkspaceJobStatus.COMPLETED.value,
+                                  "result_encrypted": _encrypt_data(result, self.settings.ENCRYPTION_KEY),
+                                  "error_code": None, "error_message": None,
+                                  "callback_delivered_at": None, "callback_retry_at": datetime.now(UTC)})
+                        idemp_db.commit()
+                return result
+
+            res = await asyncio.to_thread(execute_and_record)
 
             return {"action": "execute", "status": "completed", "result": res, "cached": False}
 
@@ -330,7 +381,11 @@ class WorkspaceWorker:
         if not delivery["messages"]:
             return
         delivery["telegram_binding_id"] = binding
-        delivery_key = f"{job.job_id}:progress" if progress else job.job_id
+        delivery_key = job.job_id
+        if progress:
+            delivery_key += ":progress"
+        elif job.status == "unknown_result":
+            delivery_key += ":unknown_result"
         update_id = -int.from_bytes(hashlib.sha256(delivery_key.encode()).digest()[:7], "big") - 1
         with self.session_factory() as db:
             if not valid_recipient(db, job.user_id, job.telegram_user_id, job.telegram_chat_id, binding):
@@ -402,10 +457,24 @@ class WorkspaceWorker:
                                    operation_id=payload_dict.get("operation_id"), service=service,
                                    operation=operation, queue_wait_ms=queue_wait)
         trace_token = active_execution.set(trace)
-        from app.workspace.network_slots import network_slots
+        from app.workspace.network_slots import before_write, network_slots
         slot_token = network_slots.set(self.network_slots)
         t_start = time.perf_counter()
         heartbeat = asyncio.create_task(self.heartbeat(job_id, attempt))
+        from threading import Lock
+
+        dispatch_lock = Lock()
+        dispatch_started = False
+        dispatch_closed = False
+
+        def guard_write():
+            nonlocal dispatch_started
+            with dispatch_lock:
+                if dispatch_closed or datetime.now(UTC) >= deadline:
+                    raise WorkspaceError("DEADLINE_EXCEEDED", "Tác vụ đã hết hạn trước khi gửi thao tác ghi.")
+                dispatch_started = True
+
+        write_token = before_write.set(guard_write)
         try:
             from app.workspace.service import WorkspaceError
 
@@ -439,7 +508,9 @@ class WorkspaceWorker:
                 async with asyncio.timeout(remaining):
                     exec_outcome = await self.execute_job_payload(user_id, service, operation, is_write, payload_dict)
             except TimeoutError as exc:
-                code = "UNKNOWN_RESULT" if mutation else "DEADLINE_EXCEEDED"
+                with dispatch_lock:
+                    dispatch_closed = True
+                    code = "UNKNOWN_RESULT" if dispatch_started else "DEADLINE_EXCEEDED"
                 raise WorkspaceError(code, "Tác vụ đã hết thời gian thực thi.") from exc
 
             result_data = exec_outcome.get("result")
@@ -461,6 +532,9 @@ class WorkspaceWorker:
             self.finish_job(job_id, attempt, status, None, key, error=exc)
 
         finally:
+            with dispatch_lock:
+                dispatch_closed = True
+            before_write.reset(write_token)
             heartbeat.cancel()
             with suppress(asyncio.CancelledError):
                 await heartbeat

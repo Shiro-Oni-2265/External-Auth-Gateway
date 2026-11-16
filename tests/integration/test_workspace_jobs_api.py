@@ -94,3 +94,34 @@ def test_workspace_job_cancel(client_with_db):
     cancel_resp = client.post(f"/internal/v1/users/1/workspace/jobs/{job_id}/cancel", headers=headers)
     assert cancel_resp.status_code == 200
     assert cancel_resp.json()["status"] == "cancelled"
+
+
+def test_unknown_result_reconciles_only_matching_payload(client_with_db):
+    from datetime import UTC, datetime, timedelta
+    from app.workspace.idempotency import compute_payload_hash
+    from app.workspace.models import WorkspaceIdempotencyRecord
+    from app.security import encrypt_secret
+
+    client, secret = client_with_db
+    key = client.app.state.settings.ENCRYPTION_KEY
+    payload = {"action": "execute", "body": {"summary": "Meeting"}}
+    with client.app.state.session_factory() as db:
+        db.add(WorkspaceJob(job_id="late-result", user_id=1, request_id="late-result",
+                            operation_id="late-operation", service="calendar", operation="events.insert",
+                            status="unknown_result", is_write=True,
+                            payload_encrypted=encrypt_secret(json.dumps(payload), key),
+                            deadline_at=datetime.now(UTC) + timedelta(seconds=120)))
+        db.add(WorkspaceIdempotencyRecord(user_id=1, operation_id="late-operation",
+                                          payload_hash=compute_payload_hash({"other": True}),
+                                          status="completed", response_json=json.dumps({"data": {"id": "event"}})))
+        db.commit()
+    headers = {"Authorization": f"Bearer {secret}"}
+    endpoint = "/internal/v1/users/1/workspace/jobs/late-result"
+    assert client.get(endpoint, headers=headers).json()["status"] == "unknown_result"
+    with client.app.state.session_factory() as db:
+        db.query(WorkspaceIdempotencyRecord).filter_by(operation_id="late-operation").update(
+            {"payload_hash": compute_payload_hash(payload)})
+        db.commit()
+    result = client.get(endpoint, headers=headers).json()
+    assert result["status"] == "completed"
+    assert result["result"]["data"]["id"] == "event"

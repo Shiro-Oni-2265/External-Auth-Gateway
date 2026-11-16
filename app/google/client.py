@@ -77,9 +77,11 @@ class UnifiedGoogleClient:
         self.max_user_writes = max_user_writes
         self._user_read_semaphores: dict[int, asyncio.Semaphore] = {}
         self._user_write_semaphores: dict[int, asyncio.Semaphore] = {}
+        self.http2_enabled = True
         self._http_client = http_client or httpx.AsyncClient(
+            http2=True,
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=30.0),
-            timeout=120.0,
+            timeout=httpx.Timeout(timeout=120.0, connect=3.0, pool=2.0),
         )
 
     def get_user_google_connection(self, user_id: int):
