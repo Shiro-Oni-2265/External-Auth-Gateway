@@ -54,13 +54,14 @@ class MCPStreamableClient:
     def __init__(self, service: str, base_url: Optional[str] = None):
         self.service = service
         self.base_url = base_url or ENDPOINTS.get(service, f"https://{service}mcp.googleapis.com/mcp/v1")
+        self.session_id: Optional[str] = None
         self._http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(30.0, connect=5.0),
             limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
         )
 
     async def initialize(self, token: str, user_id: int, connection_version: int) -> Dict[str, Any]:
-        """Perform MCP lifecycle initialize handshake."""
+        """Perform MCP lifecycle initialize handshake and capture Mcp-Session-Id."""
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -68,6 +69,9 @@ class MCPStreamableClient:
             "X-User-ID": str(user_id),
             "X-Connection-Version": str(connection_version),
         }
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -89,6 +93,11 @@ class MCPStreamableClient:
         if resp.status_code >= 400:
             raise MCPError(f"Initialize failed with status {resp.status_code}", status_code=resp.status_code)
         
+        # Save Mcp-Session-Id if returned by server
+        sess_hdr = resp.headers.get("Mcp-Session-Id") or resp.headers.get("mcp-session-id")
+        if sess_hdr:
+            self.session_id = sess_hdr
+
         data = resp.json()
         if "error" in data:
             raise MCPError(f"MCP Initialize Error: {data['error']}", data=data["error"])
@@ -110,6 +119,9 @@ class MCPStreamableClient:
             "X-User-ID": str(user_id),
             "X-Connection-Version": str(connection_version),
         }
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+
         payload = {
             "jsonrpc": "2.0",
             "id": 2,
@@ -145,6 +157,8 @@ class MCPStreamableClient:
             "X-User-ID": str(user_id),
             "X-Connection-Version": str(connection_version),
         }
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
         payload = {
             "jsonrpc": "2.0",
             "id": 2,

@@ -345,11 +345,9 @@ class GoogleClient:
 
         # Retry once on 401 if token expired unexpectedly
         if resp.status_code == 401 and retry_on_401:
-            # Force refresh by expiring the token in memory/DB or calling get_valid_access_token
-            # In our implementation, we can retry with a refreshed token
             try:
-                # Discard current access token and re-fetch
-                token = self.oauth_service.get_valid_access_token(user_id)
+                # Discard current access token and re-fetch with force_refresh=True
+                token = self.oauth_service.get_valid_access_token(user_id, force_refresh=True)
                 req_headers["Authorization"] = f"Bearer {token}"
                 with outbound_slot(user_id, write=method not in {"GET", "HEAD"}):
                     resp = httpx.request(

@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import secrets
@@ -259,63 +260,74 @@ class GoogleOAuthService:
                 db.add(conn)
             db.commit()
 
-    def get_valid_access_token(self, user_id: int, force_refresh: bool = False) -> str:
-        lock = self._get_user_lock(user_id)
-        with lock:
-            now = datetime.now(UTC)
-            with self.session_factory() as db:
-                conn = db.query(GoogleConnection).filter_by(user_id=user_id).first()
-                if not conn or conn.status != "connected":
-                    raise GoogleAuthRevokedError(
-                        "Google connection is missing or not in connected status."
-                    )
+    def _perform_network_refresh(self, user_id: int) -> tuple[str, int]:
+        """Thực hiện HTTP POST refresh token với Google endpoint."""
+        with self.session_factory() as db:
+            conn = db.query(GoogleConnection).filter_by(user_id=user_id).first()
+            if not conn or conn.status != "connected":
+                raise GoogleAuthRevokedError("Google connection is missing or not connected.")
+            refresh_token = self._decrypt(conn.encrypted_refresh_token)
+            if not refresh_token:
+                conn.status = "reconnect_required"
+                db.commit()
+                raise GoogleAuthRevokedError("No refresh token available. Reconnect required.")
 
-                # If token still valid for more than 5 minutes and not force_refresh, return it
-                if not force_refresh and ensure_utc(conn.expires_at) > now + timedelta(minutes=5):
-                    return self._decrypt(conn.encrypted_access_token)
+        refresh_data = {
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        }
+        try:
+            with outbound_slot(user_id), measure_stage("token_refresh_ms"):
+                resp = httpx.post(self.TOKEN_ENDPOINT, data=refresh_data, timeout=20.0)
+            data = resp.json()
+        except Exception as e:
+            raise GoogleOAuthError(f"Network error refreshing Google token: {e}") from e
 
-                refresh_token = self._decrypt(conn.encrypted_refresh_token)
-                if not refresh_token:
-                    conn.status = "reconnect_required"
-                    db.commit()
-                    raise GoogleAuthRevokedError("No refresh token available. Reconnect required.")
-
-            # Perform refresh
-            refresh_data = {
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "refresh_token": refresh_token,
-                "grant_type": "refresh_token",
-            }
-            try:
-                with outbound_slot(user_id), measure_stage("token_refresh_ms"):
-                    resp = httpx.post(self.TOKEN_ENDPOINT, data=refresh_data, timeout=20.0)
-                data = resp.json()
-            except Exception as e:
-                raise GoogleOAuthError(f"Network error refreshing Google token: {e}") from e
-
-            with self.session_factory() as db:
-                conn = db.query(GoogleConnection).filter_by(user_id=user_id).first()
-                if resp.status_code != 200:
-                    if data.get("error") == "invalid_grant":
+        if resp.status_code != 200:
+            if data.get("error") == "invalid_grant":
+                with self.session_factory() as db:
+                    conn = db.query(GoogleConnection).filter_by(user_id=user_id).first()
+                    if conn:
                         conn.status = "reconnect_required"
                         db.commit()
-                        raise GoogleAuthRevokedError(
-                            "Google refresh token revoked. Reconnect required."
-                        )
-                    raise GoogleOAuthError(f"Failed to refresh token: {data}")
+                raise GoogleAuthRevokedError("Google refresh token revoked. Reconnect required.")
+            raise GoogleOAuthError(f"Failed to refresh token: {data}")
 
-                new_access_token = data.get("access_token")
-                expires_in = data.get("expires_in", 3600)
-                conn.encrypted_access_token = self._encrypt(new_access_token)
-                conn.expires_at = datetime.now(UTC) + timedelta(seconds=expires_in)
-                # Google only returns new refresh_token if rotated
-                if "refresh_token" in data:
-                    conn.encrypted_refresh_token = self._encrypt(data["refresh_token"])
-                conn.status = "connected"
-                db.commit()
+        new_access_token = data.get("access_token")
+        expires_in = data.get("expires_in", 3600)
+        return new_access_token, expires_in
 
-                return new_access_token
+    def get_valid_access_token(self, user_id: int, force_refresh: bool = False) -> str:
+        # Check distributed lease in database to coordinate across multiple worker processes
+        now = datetime.now(UTC)
+        with self.session_factory() as db:
+            conn = db.query(GoogleConnection).filter_by(user_id=user_id).first()
+            if not conn or conn.status != "connected":
+                raise GoogleAuthRevokedError(
+                    "Google connection is missing or not in connected status."
+                )
+
+            # If token still valid for more than 5 minutes and not force_refresh, return it directly
+            if not force_refresh and ensure_utc(conn.expires_at) > now + timedelta(minutes=5):
+                return self._decrypt(conn.encrypted_access_token)
+
+        # Acquire distributed lease across processes
+        from app.auth.oauth_lease import DistributedOAuthLeaseManager
+        lease_mgr = DistributedOAuthLeaseManager(self)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(asyncio.run, lease_mgr.get_valid_token(user_id, force_refresh=force_refresh))
+                return future.result(timeout=15.0)
+        else:
+            return asyncio.run(lease_mgr.get_valid_token(user_id, force_refresh=force_refresh))
 
     def disconnect(self, user_id: int) -> None:
         with self.session_factory() as db:
