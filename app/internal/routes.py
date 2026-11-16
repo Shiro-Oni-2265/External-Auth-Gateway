@@ -90,6 +90,9 @@ class IdentityResolveRequest(BaseModel):
 
 
 def _get_google_client(request: Request) -> GoogleClient:
+    gc = getattr(request.app.state, "google_client", None)
+    if gc is not None:
+        return gc
     settings = request.app.state.settings
     session_factory = request.app.state.session_factory
     redirect_uri = settings.google_redirect_uri
@@ -101,7 +104,25 @@ def _get_google_client(request: Request) -> GoogleClient:
         encryption_key=settings.ENCRYPTION_KEY or "",
         allowed_domains=settings.GOOGLE_WORKSPACE_DOMAINS,
     )
-    return GoogleClient(oauth_service)
+    gc = GoogleClient(oauth_service)
+    request.app.state.google_client = gc
+    return gc
+
+
+def _get_workspace_service(request: Request):
+    ws = getattr(request.app.state, "workspace_service", None)
+    if ws is not None:
+        return ws
+    from app.workspace.service import WorkspaceService
+    settings = request.app.state.settings
+    google_client = _get_google_client(request)
+    ws = WorkspaceService(
+        google_client,
+        settings.ENCRYPTION_KEY or "default_key_32bytes_min_12345678",
+        use_mcp=getattr(settings, "GOOGLE_WORKSPACE_MCP_ENABLED", True),
+    )
+    request.app.state.workspace_service = ws
+    return ws
 
 
 def _get_odoo_service(request: Request, user: User) -> OdooService | None:
@@ -601,10 +622,7 @@ def execute_user_action(
                 return {'status': 'in_progress', 'message': 'Đã nhận xác nhận, đang tạo báo giá trong nền.', 'operation_id': req.operation_id}
             if req.action.startswith("workspace."):
                 service_name = req.action.split(".")[1]
-                result = WorkspaceService(
-                    _get_google_client(request), settings.ENCRYPTION_KEY,
-                    use_mcp=settings.GOOGLE_WORKSPACE_MCP_ENABLED,
-                ).execute(user_id, service_name, args)
+                result = _get_workspace_service(request).execute(user_id, service_name, args)
                 final_res = {"status": "completed", "result": result["data"]}
                 op.status = "completed"
                 op.result_json = json.dumps(final_res, ensure_ascii=False)

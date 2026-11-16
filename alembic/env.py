@@ -42,8 +42,11 @@ def run_migrations_offline() -> None:
 
 def run_migrations_online() -> None:
     from app.db import create_app_engine
-    settings = get_settings()
-    connectable = create_app_engine(settings.DATABASE_URL)
+    url = config.get_main_option("sqlalchemy.url")
+    if not url:
+        settings = get_settings()
+        url = settings.DATABASE_URL
+    connectable = create_app_engine(url)
 
     with connectable.connect() as connection:
         context.configure(

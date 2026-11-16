@@ -62,12 +62,12 @@ class DistributedOAuthLeaseManager:
             initial_token = conn.encrypted_access_token
 
         # 2. Acquire Lease with atomic conditional update
-        max_wait_seconds = 15.0
+        max_wait_seconds = max(float(self.lease_seconds) + 5.0, 35.0)
         start_wait = asyncio.get_event_loop().time()
+        lease_acquired = False
         
         while True:
             now = datetime.now(UTC)
-            lease_acquired = False
             
             with self.oauth_service.session_factory() as db:
                 lease = db.query(OAuthRefreshLease).filter_by(user_id=user_id).first()
@@ -124,8 +124,22 @@ class DistributedOAuthLeaseManager:
                         return self.oauth_service._decrypt(conn.encrypted_access_token)
 
             if asyncio.get_event_loop().time() - start_wait > max_wait_seconds:
-                logger.warning("Timed out waiting for another worker's OAuth lease; attempting override.")
+                logger.warning("Worker %s timed out waiting for another worker's OAuth lease (user %s).", self.worker_id, user_id)
                 break
+
+        # If lease was not acquired, strictly forbid network refresh!
+        if not lease_acquired:
+            with self.oauth_service.session_factory() as db:
+                conn = db.query(GoogleConnection).filter_by(user_id=user_id).first()
+                if conn:
+                    curr_version = getattr(conn, "connection_version", 1)
+                    if (
+                        curr_version > expected_connection_version
+                        or (conn.encrypted_access_token != initial_token and ensure_utc(conn.expires_at) > datetime.now(UTC) + timedelta(minutes=5))
+                        or (not force_refresh and ensure_utc(conn.expires_at) > datetime.now(UTC) + timedelta(minutes=5))
+                    ):
+                        return self.oauth_service._decrypt(conn.encrypted_access_token)
+            raise TimeoutError(f"Worker {self.worker_id} timed out waiting for OAuth lease for user {user_id}; refusing to refresh without lease.")
 
         # 3. Before dispatching network refresh, check if token was ALREADY refreshed while waiting
         with self.oauth_service.session_factory() as db:

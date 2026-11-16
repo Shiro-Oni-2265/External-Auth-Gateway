@@ -132,3 +132,143 @@ def test_cursor_protocol_integrity_cannot_mix():
     # Attempting to decode MCP cursor expecting REST must raise ProtocolCursorMismatchError
     with pytest.raises(ProtocolCursorMismatchError):
         decode_cursor(mcp_cursor, expected_protocol="rest")
+
+
+# ============================================================================
+# 3. Circuit Breaker Filtering & MCP Session Persistence Across Requests
+# ============================================================================
+
+def test_circuit_breaker_ignores_401_403_429_errors():
+    """Lỗi MCP 401, 403 và 429 không được tính vào circuit breaker để tránh lỗi quyền
+    làm các yêu cầu sau bị chuyển nhầm sang REST.
+    Chỉ lỗi hạ tầng (5xx, rớt mạng) mới ghi nhận failure và ngắt circuit.
+    """
+    from app.workspace.service import WorkspaceService, WorkspaceError
+    from app.workspace.mcp_client import MCPError
+
+    cb = AccountServiceCircuitBreaker(failure_threshold=3)
+    mock_google = MagicMock()
+    mock_conn = MagicMock()
+    mock_conn.status = "connected"
+    mock_conn.scopes = "https://www.googleapis.com/auth/calendar.readonly"
+    mock_conn.connection_version = 1
+    mock_google.get_user_google_connection.return_value = mock_conn
+    mock_google.oauth_service.get_valid_access_token.return_value = "valid_tok"
+
+    ws = WorkspaceService(
+        google_client=mock_google,
+        signing_key="default_key_32bytes_min_12345678",
+        use_mcp=True,
+        circuit_breaker=cb,
+    )
+
+    mcp_client = ws.get_mcp_client("calendar")
+
+    # 1. Simulate 403 Permission Denied (e.g. missing granular permission)
+    def raise_403(*args, **kwargs):
+        raise MCPError("Forbidden: insufficient scope", status_code=403)
+
+    mcp_client.call_tool = raise_403
+
+    # Call 5 times with 403 error
+    for _ in range(5):
+        with pytest.raises(WorkspaceError) as exc_info:
+            ws.read(user_id=1, service="calendar", payload={"method": "events.list", "parameters": {"calendarId": "primary"}})
+        assert exc_info.value.code == "PERMISSION_DENIED"
+
+    # Circuit breaker must STILL be available (failure count is 0, not tripped!)
+    assert cb.is_available(user_id=1, service="calendar") is True
+    assert cb._failures.get((1, "calendar"), 0) == 0
+
+    # 2. Simulate 401 Reconnect Required
+    def raise_401(*args, **kwargs):
+        raise MCPError("Unauthorized", status_code=401)
+
+    mcp_client.call_tool = raise_401
+    for _ in range(5):
+        with pytest.raises(WorkspaceError) as exc_info:
+            ws.read(user_id=1, service="calendar", payload={"method": "events.list", "parameters": {"calendarId": "primary"}})
+        assert exc_info.value.code == "RECONNECT_REQUIRED"
+
+    assert cb.is_available(user_id=1, service="calendar") is True
+    assert cb._failures.get((1, "calendar"), 0) == 0
+
+    # 3. Simulate 429 Rate Limit
+    def raise_429(*args, **kwargs):
+        raise MCPError("Rate limited", status_code=429)
+
+    mcp_client.call_tool = raise_429
+    for _ in range(5):
+        with pytest.raises(WorkspaceError) as exc_info:
+            ws.read(user_id=1, service="calendar", payload={"method": "events.list", "parameters": {"calendarId": "primary"}})
+        assert exc_info.value.code == "RATE_LIMIT"
+
+    assert cb.is_available(user_id=1, service="calendar") is True
+    assert cb._failures.get((1, "calendar"), 0) == 0
+
+    # 4. Now simulate 500 Infrastructure Server Error
+    def raise_500(*args, **kwargs):
+        raise MCPError("Internal Server Error", status_code=500)
+
+    mcp_client.call_tool = raise_500
+    for _ in range(3):
+        with pytest.raises(WorkspaceError):
+            ws.read(user_id=1, service="calendar", payload={"method": "events.list", "parameters": {"calendarId": "primary"}})
+
+    # After 3 server errors (failure_threshold=3), circuit breaker MUST TRIP!
+    assert cb.is_available(user_id=1, service="calendar") is False
+
+
+def test_workspace_service_preserves_mcp_session_across_multiple_calls():
+    """Verify that WorkspaceService preserves the same MCPSyncClient instance
+    and Mcp-Session-Id across multiple operations and calls.
+    """
+    from app.workspace.service import WorkspaceService
+
+    mock_google = MagicMock()
+    mock_conn = MagicMock()
+    mock_conn.status = "connected"
+    mock_conn.scopes = "https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/drive.readonly"
+    mock_conn.connection_version = 1
+    mock_google.get_user_google_connection.return_value = mock_conn
+    mock_google.oauth_service.get_valid_access_token.return_value = "valid_tok"
+
+    # Mock HTTP client responses for MCP
+    sessions_seen = []
+
+    def mock_transport_handler(request: httpx.Request):
+        sess = request.headers.get("Mcp-Session-Id")
+        sessions_seen.append(sess)
+        # Server returns a new or refreshed Mcp-Session-Id header
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json", "Mcp-Session-Id": "mcp_sess_persisted_999"},
+            json={"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"events": [{"id": "ev1"}]}}},
+        )
+
+    transport = httpx.MockTransport(mock_transport_handler)
+    mock_http_client = httpx.Client(transport=transport)
+
+    ws = WorkspaceService(
+        google_client=mock_google,
+        signing_key="default_key_32bytes_min_12345678",
+        use_mcp=True,
+        http_client=mock_http_client,
+    )
+
+    # Call 1: Initially no session id
+    res1 = ws.read(user_id=1, service="calendar", payload={"method": "events.list", "parameters": {"calendarId": "primary"}})
+    assert res1["data"]["items"] == [{"id": "ev1"}]
+    assert sessions_seen[0] is None
+
+    # Call 2: Second call MUST reuse the session ID returned by call 1!
+    res2 = ws.read(user_id=1, service="calendar", payload={"method": "events.list", "parameters": {"calendarId": "primary"}})
+    assert res2["data"]["items"] == [{"id": "ev1"}]
+    assert sessions_seen[1] == "mcp_sess_persisted_999"
+
+    # Verify the same MCPSyncClient instance is preserved
+    client1 = ws.get_mcp_client("calendar")
+    client2 = ws.get_mcp_client("calendar")
+    assert client1 is client2
+    assert client1.session_id == "mcp_sess_persisted_999"
+

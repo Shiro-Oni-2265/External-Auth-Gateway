@@ -332,7 +332,7 @@ def _read_drive_documents(user_id: int, payload: DriveKnowledgeRequest, request:
 
 
 def service_for(request, user_id):
-    from app.internal.routes import _get_google_client, _get_odoo_service, _verify_odoo_account
+    from app.internal.routes import _get_workspace_service, _get_odoo_service, _verify_odoo_account
     settings = request.app.state.settings
     with request.app.state.session_factory() as db:
         user = db.query(User).filter_by(id=user_id, active=True).first()
@@ -345,10 +345,7 @@ def service_for(request, user_id):
             except Exception:
                 secret = ""
         _verify_odoo_account(_get_odoo_service(request, user), user.odoo_uid, secret)
-    return WorkspaceService(
-        _get_google_client(request), settings.ENCRYPTION_KEY,
-        use_mcp=settings.GOOGLE_WORKSPACE_MCP_ENABLED,
-    )
+    return _get_workspace_service(request)
 
 
 @router.get("/workspace/metrics")

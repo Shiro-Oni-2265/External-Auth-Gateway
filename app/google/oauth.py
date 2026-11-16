@@ -325,7 +325,7 @@ class GoogleOAuthService:
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(asyncio.run, lease_mgr.get_valid_token(user_id, force_refresh=force_refresh))
-                return future.result(timeout=15.0)
+                return future.result(timeout=max(float(lease_mgr.lease_seconds) + 15.0, 45.0))
         else:
             return asyncio.run(lease_mgr.get_valid_token(user_id, force_refresh=force_refresh))
 

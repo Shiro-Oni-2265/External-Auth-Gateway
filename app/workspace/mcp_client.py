@@ -330,10 +330,15 @@ class MCPSyncClient:
                     message = json.loads(raw)
 
             if message.get("id") != 1 or "error" in message:
-                raise MCPError("MCP call returned error", data=message.get("error"))
+                err_data = message.get("error")
+                err_code = err_data.get("code") if isinstance(err_data, dict) else None
+                status_code = err_code if err_code in {401, 403, 429} else None
+                raise MCPError("MCP call returned error", status_code=status_code, data=err_data)
             result = message.get("result", {})
             if result.get("isError"):
-                raise MCPError("Tool returned error status", data=result)
+                err_code = result.get("code") or result.get("status_code")
+                status_code = err_code if err_code in {401, 403, 429} else 400
+                raise MCPError("Tool returned error status", status_code=status_code, data=result)
 
             data = result.get("structuredContent")
             if data is None:

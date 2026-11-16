@@ -74,6 +74,36 @@ class WorkspaceWorker:
         with session_factory() as db:
             self.network_slots = NetworkSlots(db.get_bind(), background=background)
 
+        from app.google.client import GoogleClient
+        from app.google.oauth import GoogleOAuthService
+        from app.workspace.service import WorkspaceService
+
+        self.oauth_service = GoogleOAuthService(
+            session_factory=self.session_factory,
+            client_id=getattr(self.settings, "GOOGLE_CLIENT_ID", ""),
+            client_secret=getattr(self.settings, "GOOGLE_CLIENT_SECRET", ""),
+            redirect_uri=getattr(self.settings, "google_redirect_uri", ""),
+            encryption_key=getattr(self.settings, "ENCRYPTION_KEY", "") or "",
+            allowed_domains=getattr(self.settings, "GOOGLE_WORKSPACE_DOMAINS", []),
+        )
+        self.google_client = GoogleClient(oauth_service=self.oauth_service)
+        self._workspace_svc = None
+
+    @property
+    def workspace_svc(self):
+        if getattr(self, "_workspace_svc", None) is None:
+            from app.workspace.service import WorkspaceService
+            self._workspace_svc = WorkspaceService(
+                google_client=self.google_client,
+                signing_key=getattr(self.settings, "ENCRYPTION_KEY", "") or "default_key_32bytes_min_12345678",
+                use_mcp=getattr(self.settings, "GOOGLE_WORKSPACE_MCP_ENABLED", True),
+            )
+        return self._workspace_svc
+
+    @workspace_svc.setter
+    def workspace_svc(self, value):
+        self._workspace_svc = value
+
     def claim_next_job(self, db: Session) -> Optional[WorkspaceJob]:
         """Claim next queued job or expired running job using row locks."""
         now = datetime.now(UTC)
@@ -202,25 +232,10 @@ class WorkspaceWorker:
         payload: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Execute workspace operation with strict prepare vs execute separation."""
-        from app.google.client import GoogleClient
-        from app.google.oauth import GoogleOAuthService
         from app.workspace.idempotency import IdempotencyManager
-        from app.workspace.service import WorkspaceError, WorkspaceService
+        from app.workspace.service import WorkspaceError
 
-        oauth_service = GoogleOAuthService(
-            session_factory=self.session_factory,
-            client_id=getattr(self.settings, "GOOGLE_CLIENT_ID", ""),
-            client_secret=getattr(self.settings, "GOOGLE_CLIENT_SECRET", ""),
-            redirect_uri=getattr(self.settings, "google_redirect_uri", ""),
-            encryption_key=getattr(self.settings, "ENCRYPTION_KEY", "") or "",
-            allowed_domains=getattr(self.settings, "GOOGLE_WORKSPACE_DOMAINS", []),
-        )
-        google_client = GoogleClient(oauth_service=oauth_service)
-        workspace_svc = WorkspaceService(
-            google_client=google_client,
-            signing_key=getattr(self.settings, "ENCRYPTION_KEY", "") or "default_key_32bytes_min_12345678",
-            use_mcp=getattr(self.settings, "GOOGLE_WORKSPACE_MCP_ENABLED", True),
-        )
+        workspace_svc = self.workspace_svc
 
         action = payload.get("action", "read")
         ticket = payload.get("_ticket")
@@ -575,5 +590,9 @@ class WorkspaceWorker:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        if hasattr(self, "workspace_svc") and self.workspace_svc:
+            self.workspace_svc.close()
+        if hasattr(self, "google_client") and self.google_client:
+            self.google_client.close()
         await self._http_client.aclose()
 

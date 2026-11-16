@@ -178,8 +178,11 @@ class WorkspaceService:
                         self.circuit_breaker.record_success(user_id, service)
                         return result
                 except Exception as exc:
-                    self.circuit_breaker.record_failure(user_id, service)
                     status_code = getattr(exc, "status_code", None)
+                    # 401 (auth), 403 (permissions), 429 (rate limits) are client/account/quota errors,
+                    # not MCP infrastructure outages. Do NOT trip the circuit breaker for these!
+                    if status_code not in {401, 403, 429}:
+                        self.circuit_breaker.record_failure(user_id, service)
                     code = {401: "RECONNECT_REQUIRED", 403: "PERMISSION_DENIED", 429: "RATE_LIMIT"}.get(
                         status_code, "UNKNOWN_RESULT" if spec["kind"] == "write" else "SERVICE_ERROR"
                     )
