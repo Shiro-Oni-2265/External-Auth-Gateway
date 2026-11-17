@@ -3,6 +3,7 @@ import base64
 import hashlib
 import secrets
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -20,7 +21,7 @@ from app.security import (
 )
 from app.workspace.catalog import oauth_scopes
 from app.workspace.telemetry import measure_stage
-from app.workspace.network_slots import outbound_slot
+from app.workspace.network_slots import outbound_slot, request_deadline
 
 
 class GoogleOAuthError(Exception):
@@ -233,7 +234,7 @@ class GoogleOAuthService:
 
         # Upsert GoogleConnection and check subject consistency
         with self.session_factory() as db:
-            existing = db.query(GoogleConnection).filter_by(user_id=user_id).first()
+            existing = db.query(GoogleConnection).filter_by(user_id=user_id).with_for_update().first()
             if existing:
                 if existing.google_sub != google_sub:
                     raise DifferentGoogleAccountError(
@@ -246,6 +247,8 @@ class GoogleOAuthService:
                     existing.encrypted_refresh_token = self._encrypt(refresh_token)
                 existing.expires_at = expires_at
                 existing.status = "connected"
+                existing.connection_version += 1
+                existing.link_version = getattr(existing, "link_version", 1) + 1
             else:
                 conn = GoogleConnection(
                     user_id=user_id,
@@ -256,17 +259,20 @@ class GoogleOAuthService:
                     encrypted_refresh_token=self._encrypt(refresh_token) if refresh_token else None,
                     expires_at=expires_at,
                     status="connected",
+                    connection_version=1,
+                    link_version=1,
                 )
                 db.add(conn)
             db.commit()
 
-    def _perform_network_refresh(self, user_id: int) -> tuple[str, int]:
+    def _perform_network_refresh(self, user_id: int) -> tuple[str, int, str | None]:
         """Thực hiện HTTP POST refresh token với Google endpoint."""
         with self.session_factory() as db:
             conn = db.query(GoogleConnection).filter_by(user_id=user_id).first()
             if not conn or conn.status != "connected":
                 raise GoogleAuthRevokedError("Google connection is missing or not connected.")
             refresh_token = self._decrypt(conn.encrypted_refresh_token)
+            identity = (conn.google_sub, conn.connection_version, conn.encrypted_refresh_token)
             if not refresh_token:
                 conn.status = "reconnect_required"
                 db.commit()
@@ -280,7 +286,11 @@ class GoogleOAuthService:
         }
         try:
             with outbound_slot(user_id), measure_stage("token_refresh_ms"):
-                resp = httpx.post(self.TOKEN_ENDPOINT, data=refresh_data, timeout=20.0)
+                deadline = request_deadline.get()
+                remaining = min(20.0, deadline - time.monotonic()) if deadline is not None else 20.0
+                if remaining <= 0:
+                    raise TimeoutError("OAuth request deadline expired")
+                resp = httpx.post(self.TOKEN_ENDPOINT, data=refresh_data, timeout=remaining)
             data = resp.json()
         except Exception as e:
             raise GoogleOAuthError(f"Network error refreshing Google token: {e}") from e
@@ -288,16 +298,20 @@ class GoogleOAuthService:
         if resp.status_code != 200:
             if data.get("error") == "invalid_grant":
                 with self.session_factory() as db:
-                    conn = db.query(GoogleConnection).filter_by(user_id=user_id).first()
-                    if conn:
+                    conn = db.query(GoogleConnection).filter_by(user_id=user_id).with_for_update().first()
+                    if conn and (conn.google_sub, conn.connection_version, conn.encrypted_refresh_token) == identity:
                         conn.status = "reconnect_required"
+                        conn.connection_version = getattr(conn, "connection_version", 1) + 1
+                        conn.link_version = getattr(conn, "link_version", 1) + 1
                         db.commit()
                 raise GoogleAuthRevokedError("Google refresh token revoked. Reconnect required.")
             raise GoogleOAuthError(f"Failed to refresh token: {data}")
 
         new_access_token = data.get("access_token")
         expires_in = data.get("expires_in", 3600)
-        return new_access_token, expires_in
+        if not isinstance(new_access_token, str) or not new_access_token:
+            raise GoogleOAuthError("Google token refresh response did not contain an access token")
+        return new_access_token, expires_in, data.get("refresh_token")
 
     def get_valid_access_token(self, user_id: int, force_refresh: bool = False) -> str:
         # Check distributed lease in database to coordinate across multiple worker processes
@@ -337,6 +351,8 @@ class GoogleOAuthService:
 
             refresh_token = self._decrypt(conn.encrypted_refresh_token)
             conn.status = "disconnected"
+            conn.connection_version = getattr(conn, "connection_version", 1) + 1
+            conn.link_version = getattr(conn, "link_version", 1) + 1
             db.commit()
 
         # Revoke token with Google

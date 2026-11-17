@@ -168,20 +168,24 @@ class DistributedOAuthLeaseManager:
 
         # 4. Perform the actual refresh under lease
         try:
+            rotated_refresh_token = None
             if hasattr(self.oauth_service, "_perform_network_refresh"):
-                new_token, expires_in = self.oauth_service._perform_network_refresh(user_id)
+                new_token, expires_in, *rotated = self.oauth_service._perform_network_refresh(user_id)
+                if rotated:
+                    rotated_refresh_token = rotated[0]
             else:
                 # Delegate to GoogleOAuthService refresh logic
                 new_token = self.oauth_service.get_valid_access_token(user_id, force_refresh=True)
                 expires_in = 3600
 
             with self.oauth_service.session_factory() as db:
-                conn = db.query(GoogleConnection).filter_by(user_id=user_id).first()
-                lease = db.query(OAuthRefreshLease).filter_by(user_id=user_id).first()
-                if lease and lease.lease_holder == self.worker_id:
-                    lease.lease_holder = None
-                    lease.lease_expires_at = None
-                    lease.connection_version += 1
+                conn = db.query(GoogleConnection).filter_by(user_id=user_id).with_for_update().first()
+                lease = db.query(OAuthRefreshLease).filter_by(user_id=user_id).with_for_update().first()
+                if not lease or lease.lease_holder != self.worker_id:
+                    raise TimeoutError("OAuth refresh lease was lost before saving tokens")
+                lease.lease_holder = None
+                lease.lease_expires_at = None
+                lease.connection_version += 1
 
                 if not conn or conn.status != "connected":
                     db.commit()
@@ -203,6 +207,8 @@ class DistributedOAuthLeaseManager:
                     return self.oauth_service._decrypt(conn.encrypted_access_token)
 
                 conn.encrypted_access_token = self.oauth_service._encrypt(new_token)
+                if rotated_refresh_token:
+                    conn.encrypted_refresh_token = self.oauth_service._encrypt(rotated_refresh_token)
                 conn.expires_at = datetime.now(UTC) + timedelta(seconds=expires_in)
                 conn.status = "connected"
                 conn.connection_version = curr_version + 1

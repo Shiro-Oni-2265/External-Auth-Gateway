@@ -31,6 +31,7 @@ def client_with_db(tmp_path):
         TELEGRAM_WEBHOOK_SECRET="expected_webhook_secret_xyz",
         AGENT_TO_GATEWAY_SECRET=agent_secret,
         GOOGLE_WORKSPACE_MCP_ENABLED=True,
+        WORKSPACE_EMBEDDED_WORKER=False,
     )
     app = create_app(settings)
 

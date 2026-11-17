@@ -8,7 +8,8 @@ x-workspace: &workspace
 
 services:
   postgres:
-    image: postgres:16
+    image: pgvector/pgvector:pg16
+    command: [postgres, -c, log_parameter_max_length=0, -c, log_parameter_max_length_on_error=0]
     environment:
       POSTGRES_DB: gateway
       POSTGRES_USER: gateway

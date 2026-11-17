@@ -227,6 +227,86 @@ class MCPSyncClient:
             transport=transport,
         )
         self._owns_client = http_client is None
+        from threading import Lock
+
+        self._initialize_lock = Lock()
+        self.protocol_version = None
+        self._tools = None
+
+    def _headers(self, token):
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json, text/event-stream"}
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        if self.protocol_version:
+            headers["MCP-Protocol-Version"] = self.protocol_version
+        return headers
+
+    @staticmethod
+    def _timeout():
+        from app.workspace.network_slots import request_deadline
+
+        deadline = request_deadline.get()
+        remaining = min(9.0, deadline - time.monotonic()) if deadline is not None else 9.0
+        if remaining <= 0:
+            raise MCPError("MCP request deadline expired")
+        return httpx.Timeout(remaining, connect=min(3, remaining), pool=min(2, remaining))
+
+    def _rpc(self, token, payload):
+        with self._shared_client.stream("POST", self.base_url, headers=self._headers(token), json=payload,
+                                        timeout=self._timeout()) as response:
+            if response.status_code >= 400:
+                raise MCPError("MCP lifecycle request rejected", status_code=response.status_code)
+            if "id" not in payload:
+                return {}
+            session = response.headers.get("Mcp-Session-Id")
+            if session:
+                self.session_id = session
+            if "text/event-stream" in response.headers.get("Content-Type", ""):
+                data = self._parse_sse_response(response.iter_text())
+            else:
+                raw = bytearray()
+                for chunk in response.iter_bytes():
+                    raw.extend(chunk)
+                    if len(raw) > 8 * 1024 * 1024:
+                        raise MCPError("Response exceeds 8 MiB")
+                data = json.loads(raw)
+            if data.get("id") != payload["id"] or "error" in data:
+                error = data.get("error") or {}
+                code = error.get("code") if isinstance(error, dict) else None
+                raise MCPError("Invalid MCP lifecycle response", status_code=code if code in {401, 403, 429} else None)
+            return data.get("result", {})
+
+    def _ensure_ready(self, token):
+        with self._initialize_lock:
+            if self._tools is not None:
+                return
+            try:
+                result = self._rpc(token, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                    "protocolVersion": "2025-11-25", "capabilities": {},
+                    "clientInfo": {"name": "odoo-auth-gateway", "version": "1.0"},
+                }})
+                version = result.get("protocolVersion")
+                if version not in {"2025-11-25", "2025-06-18", "2025-03-26"}:
+                    raise MCPError("Unsupported MCP protocol version")
+                self.protocol_version = version
+                self._rpc(token, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+                tools = {}
+                params = {}
+                for index in range(20):
+                    page = self._rpc(token, {"jsonrpc": "2.0", "id": 2 + index, "method": "tools/list", "params": params})
+                    for tool in page.get("tools", []):
+                        if isinstance(tool.get("inputSchema"), dict):
+                            tools[tool["name"]] = tool["inputSchema"]
+                    cursor = page.get("nextCursor")
+                    if not cursor:
+                        self._tools = tools
+                        return
+                    params = {"cursor": cursor}
+                raise MCPError("MCP tool listing exceeded page limit")
+            except Exception:
+                self.session_id = None
+                self.protocol_version = None
+                raise
 
     def initialize(self, token: str, user_id: int, connection_version: int = 1) -> Dict[str, Any]:
         """Perform MCP initialize handshake and capture Mcp-Session-Id."""
@@ -291,11 +371,16 @@ class MCPSyncClient:
         user_id: Optional[int] = None,
         connection_version: int = 1,
     ) -> Dict[str, Any]:
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-        }
+        from jsonschema import ValidationError, validate
+
+        self._ensure_ready(token)
+        if name not in self._tools:
+            raise MCPError("MCP tool unavailable", status_code=501)
+        try:
+            validate(arguments, self._tools[name])
+        except ValidationError as exc:
+            raise MCPError("Invalid MCP arguments", status_code=400) from exc
+        headers = self._headers(token)
         if user_id is not None:
             headers["X-User-ID"] = str(user_id)
             headers["X-Connection-Version"] = str(connection_version)
@@ -309,8 +394,14 @@ class MCPSyncClient:
             "params": {"name": name, "arguments": arguments},
         }
         try:
-            with self._shared_client.stream("POST", self.base_url, headers=headers, json=payload) as response:
+            with self._shared_client.stream("POST", self.base_url, headers=headers, json=payload,
+                                            timeout=self._timeout()) as response:
                 if response.status_code != 200:
+                    if response.status_code == 404:
+                        with self._initialize_lock:
+                            self.session_id = None
+                            self.protocol_version = None
+                            self._tools = None
                     raise MCPError(f"Tool call failed with status {response.status_code}", status_code=response.status_code)
 
                 # Capture or refresh session id

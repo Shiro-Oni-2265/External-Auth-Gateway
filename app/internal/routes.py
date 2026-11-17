@@ -131,8 +131,14 @@ def _get_odoo_service(request: Request, user: User) -> OdooService | None:
     odoo_db = user.database or settings.ODOO_DB
     if not odoo_url or not odoo_db:
         return None
-    odoo_client = OdooClient(url=odoo_url, db=odoo_db)
-    return OdooService(odoo_client)
+    state = request.app.state
+    with state.outbound_clients_lock:
+        key = (odoo_url, odoo_db)
+        client = state.odoo_clients.get(key)
+        if client is None:
+            client = OdooClient(url=odoo_url, db=odoo_db)
+            state.odoo_clients[key] = client
+    return OdooService(client)
 
 
 @router.post("/identity/resolve")

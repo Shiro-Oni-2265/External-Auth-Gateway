@@ -32,7 +32,8 @@ def find_free_port() -> int:
 @pytest.fixture
 def multi_worker_db(tmp_path):
     db_file = tmp_path / "multi_worker.db"
-    engine = create_engine(f"sqlite:///{db_file}")
+    db_url = os.environ.get("STAGE3_OAUTH_TEST_URL") or f"sqlite:///{db_file.as_posix()}"
+    engine = create_engine(db_url)
     Base.metadata.create_all(bind=engine)
     session_factory = sessionmaker(bind=engine)
 
@@ -64,7 +65,14 @@ def multi_worker_db(tmp_path):
         db.add(conn)
         db.commit()
 
-    return session_factory, db_file
+    try:
+        yield session_factory, db_url
+    finally:
+        with session_factory.begin() as db:
+            for model in (OAuthRefreshLease, GoogleConnection):
+                db.query(model).filter_by(user_id=1).delete()
+            db.query(User).filter_by(id=1).delete()
+        engine.dispose()
 
 
 def test_two_workers_coordinate_oauth_refresh_single_execution(multi_worker_db):
@@ -184,7 +192,7 @@ def test_two_os_processes_coordinate_oauth_refresh_single_network_call(multi_wor
     against a shared database and a mock Google token HTTP endpoint.
     Proves that cross-process coordination works and only EXACTLY 1 network refresh request is dispatched.
     """
-    session_factory, db_file = multi_worker_db
+    session_factory, db_url = multi_worker_db
 
     class MockGoogleTokenHandler(BaseHTTPRequestHandler):
         refresh_requests = 0
@@ -215,7 +223,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from app.google.oauth import GoogleOAuthService
 
-db_url = "sqlite:///" + sys.argv[1].replace("\\\\", "/")
+db_url = os.environ["STAGE3_TEST_WORKER_URL"]
 token_port = sys.argv[2]
 worker_name = sys.argv[3]
 
@@ -240,15 +248,15 @@ print(f"SUCCESS:{{token}}")
 
     # Spawn two independent OS processes
     p1 = subprocess.Popen(
-        [sys.executable, "-c", worker_script, str(db_file), str(port), "proc_1"],
-        env=env,
+        [sys.executable, "-c", worker_script, "fixture", str(port), "proc_1"],
+        env={**env, "STAGE3_TEST_WORKER_URL": db_url},
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
     p2 = subprocess.Popen(
-        [sys.executable, "-c", worker_script, str(db_file), str(port), "proc_2"],
-        env=env,
+        [sys.executable, "-c", worker_script, "fixture", str(port), "proc_2"],
+        env={**env, "STAGE3_TEST_WORKER_URL": db_url},
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,

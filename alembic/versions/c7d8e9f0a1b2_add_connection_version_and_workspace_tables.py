@@ -85,28 +85,10 @@ def upgrade():
 
 
 def downgrade():
+    # The other tables and columns predate this revision on Stage 2 installations.
     bind = op.get_bind()
     insp = sa.inspect(bind)
-    tables = set(insp.get_table_names())
-
-    if "workspace_idempotency_records" in tables:
-        op.drop_table("workspace_idempotency_records")
-
-    if "oauth_refresh_leases" in tables:
-        op.drop_table("oauth_refresh_leases")
-
-    if "workspace_jobs" in tables:
-        job_cols = {c["name"] for c in insp.get_columns("workspace_jobs")}
-        indexes = {idx["name"] for idx in insp.get_indexes("workspace_jobs")}
-        with op.batch_alter_table("workspace_jobs") as table:
-            if "ix_workspace_jobs_operation_id" in indexes:
-                table.drop_index("ix_workspace_jobs_operation_id")
-            if "operation_id" in job_cols:
-                table.drop_column("operation_id")
-            if "action" in job_cols:
-                table.drop_column("action")
-
-    if "google_connections" in tables:
+    if "google_connections" in insp.get_table_names():
         cols = {c["name"] for c in insp.get_columns("google_connections")}
         if "connection_version" in cols:
             with op.batch_alter_table("google_connections") as table:

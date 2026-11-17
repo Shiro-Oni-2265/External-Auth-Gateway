@@ -139,10 +139,10 @@ def test_upgrade_from_88af2d954a02_adds_connection_version_and_tables(alembic_te
     # 5. Run alembic downgrade back to 88af2d954a02
     command.downgrade(cfg, "88af2d954a02")
 
-    # 6. Verify connection_version was dropped and coordination tables dropped
+    # 6. Rollback removes only the Stage 3 column and preserves coordination state.
     insp = inspect(engine)
     cols_downgraded = {c["name"] for c in insp.get_columns("google_connections")}
     assert "connection_version" not in cols_downgraded
     tables_downgraded = set(insp.get_table_names())
-    assert "oauth_refresh_leases" not in tables_downgraded
-    assert "workspace_idempotency_records" not in tables_downgraded
+    assert {"oauth_refresh_leases", "workspace_idempotency_records"} <= tables_downgraded
+    assert {"action", "operation_id"} <= {c["name"] for c in insp.get_columns("workspace_jobs")}

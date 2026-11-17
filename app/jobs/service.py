@@ -41,12 +41,18 @@ class JobService:
     def refresh_tokens_job(self) -> None:
         now = datetime.now(UTC)
         with self.session_factory() as db:
-            # Active Google connections expiring within 5 minutes
+            recent_activity = now - timedelta(minutes=30)
             expiring = (
                 db.query(GoogleConnection)
+                .join(User, User.id == GoogleConnection.user_id)
                 .filter(
+                    User.active.is_(True),
                     GoogleConnection.status == "connected",
                     GoogleConnection.expires_at <= now + timedelta(minutes=5),
+                    (User.updated_at >= recent_activity) | (GoogleConnection.updated_at >= recent_activity)
+                    | db.query(TelegramUpdate.id).filter(
+                        TelegramUpdate.user_id == User.id, TelegramUpdate.created_at >= recent_activity,
+                    ).exists(),
                 )
                 .all()
             )

@@ -1,6 +1,7 @@
 """Tests for Stage 3 Phase 3: MCP Client Session Lifecycle, tools/list, and Protocol Routing."""
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+import json
 import httpx
 
 from app.workspace.mcp_client import MCPStreamableClient, MCPError
@@ -138,13 +139,14 @@ def test_cursor_protocol_integrity_cannot_mix():
 # 3. Circuit Breaker Filtering & MCP Session Persistence Across Requests
 # ============================================================================
 
-def test_circuit_breaker_ignores_401_403_429_errors():
+def test_circuit_breaker_ignores_401_403_429_errors(monkeypatch):
     """Lỗi MCP 401, 403 và 429 không được tính vào circuit breaker để tránh lỗi quyền
     làm các yêu cầu sau bị chuyển nhầm sang REST.
     Chỉ lỗi hạ tầng (5xx, rớt mạng) mới ghi nhận failure và ngắt circuit.
     """
     from app.workspace.service import WorkspaceService, WorkspaceError
     from app.workspace.mcp_client import MCPError
+    monkeypatch.setattr("app.workspace.service.time.sleep", lambda _: None)
 
     cb = AccountServiceCircuitBreaker(failure_threshold=3)
     mock_google = MagicMock()
@@ -160,9 +162,10 @@ def test_circuit_breaker_ignores_401_403_429_errors():
         signing_key="default_key_32bytes_min_12345678",
         use_mcp=True,
         circuit_breaker=cb,
+        transport=httpx.MockTransport(lambda _: httpx.Response(503)),
     )
 
-    mcp_client = ws.get_mcp_client("calendar")
+    mcp_client = ws.get_mcp_client("calendar", 1, 1)
 
     # 1. Simulate 403 Permission Denied (e.g. missing granular permission)
     def raise_403(*args, **kwargs):
@@ -238,6 +241,16 @@ def test_workspace_service_preserves_mcp_session_across_multiple_calls():
 
     def mock_transport_handler(request: httpx.Request):
         sess = request.headers.get("Mcp-Session-Id")
+        call = json.loads(request.content)
+        if call["method"] == "initialize":
+            return httpx.Response(200, headers={"Mcp-Session-Id": "mcp_sess_persisted_999"},
+                                  json={"id": call["id"], "result": {"protocolVersion": "2025-11-25"}})
+        if call["method"] == "notifications/initialized":
+            return httpx.Response(202)
+        if call["method"] == "tools/list":
+            return httpx.Response(200, json={"id": call["id"], "result": {"tools": [
+                {"name": "list_events", "inputSchema": {"type": "object"}},
+            ]}})
         sessions_seen.append(sess)
         # Server returns a new or refreshed Mcp-Session-Id header
         return httpx.Response(
@@ -259,7 +272,7 @@ def test_workspace_service_preserves_mcp_session_across_multiple_calls():
     # Call 1: Initially no session id
     res1 = ws.read(user_id=1, service="calendar", payload={"method": "events.list", "parameters": {"calendarId": "primary"}})
     assert res1["data"]["items"] == [{"id": "ev1"}]
-    assert sessions_seen[0] is None
+    assert sessions_seen[0] == "mcp_sess_persisted_999"
 
     # Call 2: Second call MUST reuse the session ID returned by call 1!
     res2 = ws.read(user_id=1, service="calendar", payload={"method": "events.list", "parameters": {"calendarId": "primary"}})
@@ -267,8 +280,9 @@ def test_workspace_service_preserves_mcp_session_across_multiple_calls():
     assert sessions_seen[1] == "mcp_sess_persisted_999"
 
     # Verify the same MCPSyncClient instance is preserved
-    client1 = ws.get_mcp_client("calendar")
-    client2 = ws.get_mcp_client("calendar")
+    client1 = ws.get_mcp_client("calendar", 1, 1)
+    client2 = ws.get_mcp_client("calendar", 1, 1)
     assert client1 is client2
     assert client1.session_id == "mcp_sess_persisted_999"
-
+    assert ws.get_mcp_client("calendar", 2, 1).session_id is None
+    assert ws.get_mcp_client("calendar", 1, 2).session_id is None

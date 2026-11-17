@@ -112,6 +112,7 @@ class GoogleConnection(Base):
         String(32), default="connected", nullable=False
     )  # 'connected', 'reconnect_required', 'disconnected'
     connection_version = Column(Integer, nullable=False, default=1)
+    link_version = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime, default=utc_now, nullable=False)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 

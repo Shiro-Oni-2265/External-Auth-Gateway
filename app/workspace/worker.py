@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
-from datetime import UTC, datetime, timedelta
 import json
 import logging
-from typing import Any, Dict, Optional
+from contextlib import suppress
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
 import httpx
 from sqlalchemy.orm import Session
 
@@ -19,14 +20,23 @@ logger = logging.getLogger(__name__)
 
 
 def valid_recipient(db, user_id, telegram_user_id, chat_id, binding):
-    return bool(binding and db.query(TelegramConnection).join(User).filter(
-        User.id == user_id, User.active.is_(True), TelegramConnection.status == "connected",
-        TelegramConnection.telegram_user_id == telegram_user_id,
-        TelegramConnection.private_chat_id == chat_id, TelegramConnection.binding_id == binding,
-    ).first())
+    return bool(
+        binding
+        and db.query(TelegramConnection)
+        .join(User)
+        .filter(
+            User.id == user_id,
+            User.active.is_(True),
+            TelegramConnection.status == "connected",
+            TelegramConnection.telegram_user_id == telegram_user_id,
+            TelegramConnection.private_chat_id == chat_id,
+            TelegramConnection.binding_id == binding,
+        )
+        .first()
+    )
 
 
-def _encrypt_data(data: Any, key: Optional[str]) -> str:
+def _encrypt_data(data: Any, key: str | None) -> str:
     raw = json.dumps(data)
     if key:
         try:
@@ -36,7 +46,7 @@ def _encrypt_data(data: Any, key: Optional[str]) -> str:
     return raw
 
 
-def _decrypt_data(raw: Optional[str], key: Optional[str]) -> Any:
+def _decrypt_data(raw: str | None, key: str | None) -> Any:
     if not raw:
         return None
     if key:
@@ -59,7 +69,7 @@ class WorkspaceWorker:
         session_factory: Any,
         worker_id: str = "workspace-worker-1",
         poll_interval: float = 1.0,
-        http_client: Optional[httpx.AsyncClient] = None,
+        http_client: httpx.AsyncClient | None = None,
         background: bool = False,
     ):
         self.settings = settings
@@ -69,14 +79,14 @@ class WorkspaceWorker:
         self.background = background
         self._http_client = http_client or httpx.AsyncClient(timeout=10.0)
         self._running = False
-        self._task: Optional[asyncio.Task] = None
+        self._task: asyncio.Task | None = None
         from app.workspace.network_slots import NetworkSlots
+
         with session_factory() as db:
             self.network_slots = NetworkSlots(db.get_bind(), background=background)
 
         from app.google.client import GoogleClient
         from app.google.oauth import GoogleOAuthService
-        from app.workspace.service import WorkspaceService
 
         self.oauth_service = GoogleOAuthService(
             session_factory=self.session_factory,
@@ -88,14 +98,30 @@ class WorkspaceWorker:
         )
         self.google_client = GoogleClient(oauth_service=self.oauth_service)
         self._workspace_svc = None
+        self._drive_runtime = None
+
+    @property
+    def drive_runtime(self):
+        if self._drive_runtime is None:
+            from app.workspace.drive_runtime import DriveRuntime
+
+            self._drive_runtime = DriveRuntime(
+                self.settings,
+                self.session_factory,
+                self.workspace_svc,
+                self._http_client,
+            )
+        return self._drive_runtime
 
     @property
     def workspace_svc(self):
         if getattr(self, "_workspace_svc", None) is None:
             from app.workspace.service import WorkspaceService
+
             self._workspace_svc = WorkspaceService(
                 google_client=self.google_client,
-                signing_key=getattr(self.settings, "ENCRYPTION_KEY", "") or "default_key_32bytes_min_12345678",
+                signing_key=getattr(self.settings, "ENCRYPTION_KEY", "")
+                or "default_key_32bytes_min_12345678",
                 use_mcp=getattr(self.settings, "GOOGLE_WORKSPACE_MCP_ENABLED", True),
             )
         return self._workspace_svc
@@ -104,7 +130,7 @@ class WorkspaceWorker:
     def workspace_svc(self, value):
         self._workspace_svc = value
 
-    def claim_next_job(self, db: Session) -> Optional[WorkspaceJob]:
+    def claim_next_job(self, db: Session) -> WorkspaceJob | None:
         """Claim next queued job or expired running job using row locks."""
         now = datetime.now(UTC)
         query = db.query(WorkspaceJob).filter(
@@ -116,19 +142,29 @@ class WorkspaceWorker:
         )
         if self.background:
             query = query.filter(WorkspaceJob.action == "index")
-            if db.query(WorkspaceJob.id).filter(
-                WorkspaceJob.action != "index", WorkspaceJob.status == WorkspaceJobStatus.QUEUED.value,
-                WorkspaceJob.deadline_at > now,
-            ).first():
+            if (
+                not getattr(self.settings, "DRIVE_INDEX_ENABLED", False)
+                and db.query(WorkspaceJob.id)
+                .filter(
+                    WorkspaceJob.action != "index",
+                    WorkspaceJob.status == WorkspaceJobStatus.QUEUED.value,
+                    WorkspaceJob.deadline_at > now,
+                )
+                .first()
+            ):
                 return None
         else:
             query = query.filter(WorkspaceJob.action != "index")
-        
+
         # Check if database dialect supports FOR UPDATE SKIP LOCKED (PostgreSQL)
         bind = db.get_bind()
         if bind and bind.dialect.name == "postgresql":
             query = query.with_for_update(skip_locked=True)
 
+        if self.background:
+            from sqlalchemy import case
+
+            query = query.order_by(case((WorkspaceJob.operation == "index.preview", 0), else_=1))
         job = query.order_by(WorkspaceJob.created_at.asc()).first()
         if not job:
             return None
@@ -172,10 +208,18 @@ class WorkspaceWorker:
     def finish_job(self, job_id, attempt, status, result, key, error=None):
         now = datetime.now(UTC)
         with self.session_factory() as db:
-            job = db.query(WorkspaceJob).filter_by(
-                job_id=job_id, worker_id=self.worker_id, retry_count=attempt,
-                status=WorkspaceJobStatus.RUNNING.value,
-            ).filter(WorkspaceJob.lease_expires_at > now).with_for_update().first()
+            job = (
+                db.query(WorkspaceJob)
+                .filter_by(
+                    job_id=job_id,
+                    worker_id=self.worker_id,
+                    retry_count=attempt,
+                    status=WorkspaceJobStatus.RUNNING.value,
+                )
+                .filter(WorkspaceJob.lease_expires_at > now)
+                .with_for_update()
+                .first()
+            )
             if job is None:
                 return False
             if status == WorkspaceJobStatus.UNKNOWN_RESULT.value and job.operation_id:
@@ -183,15 +227,32 @@ class WorkspaceWorker:
 
                 evidence = IdempotencyManager().get_record(db, job.operation_id)
                 payload = _decrypt_data(job.payload_encrypted, key)
-                if (evidence and evidence.status == "completed" and evidence.user_id == job.user_id
-                        and evidence.payload_hash == compute_payload_hash(payload) and evidence.response_json):
+                if (
+                    evidence
+                    and evidence.status == "completed"
+                    and evidence.user_id == job.user_id
+                    and evidence.payload_hash == compute_payload_hash(payload)
+                    and evidence.response_json
+                ):
                     status = WorkspaceJobStatus.COMPLETED.value
                     result = json.loads(evidence.response_json)
                     error = None
             job.status = status
+            scoped_formats = {"indexed_drive_v1", "workspace_plan_v1"}
+            if isinstance(result, dict) and result.get("format") in scoped_formats:
+                from app.workspace.drive_runtime import safe_result
+
+                result = safe_result(db, job.user_id, result)
             job.completed_at = now
-            job.result_encrypted = _encrypt_data(result, key)
-            job.callback_retry_at = now
+            indexed = isinstance(result, dict) and result.get("format") in scoped_formats
+            job.result_encrypted = (
+                encrypt_secret(json.dumps(result), key) if indexed else _encrypt_data(result, key)
+            )
+            job.callback_retry_at = (
+                None
+                if job.action == "index" and getattr(self.settings, "DRIVE_INDEX_ENABLED", False)
+                else now
+            )
             if error is not None:
                 job.error_code = getattr(error, "code", type(error).__name__)
                 job.error_message = str(error)
@@ -203,11 +264,16 @@ class WorkspaceWorker:
         key = self.settings.ENCRYPTION_KEY
         with self.session_factory() as db:
             query = db.query(WorkspaceJob).filter(
-                WorkspaceJob.callback_delivered_at.is_(None), WorkspaceJob.callback_retry_at <= now,
+                WorkspaceJob.callback_delivered_at.is_(None),
+                WorkspaceJob.callback_retry_at <= now,
             )
             if job_id is not None:
                 query = query.filter_by(job_id=job_id)
-            job = query.order_by(WorkspaceJob.callback_retry_at).with_for_update(skip_locked=True).first()
+            job = (
+                query.order_by(WorkspaceJob.callback_retry_at)
+                .with_for_update(skip_locked=True)
+                .first()
+            )
             if job is None:
                 return False
             job_id = job.job_id
@@ -217,9 +283,12 @@ class WorkspaceWorker:
             db.commit()
         if await self.send_callback(job, _decrypt_data(job.result_encrypted, key)):
             with self.session_factory() as db:
-                db.query(WorkspaceJob).filter_by(job_id=job_id, status=job.status).update({
-                    "callback_delivered_at": datetime.now(UTC), "callback_retry_at": None,
-                })
+                db.query(WorkspaceJob).filter_by(job_id=job_id, status=job.status).update(
+                    {
+                        "callback_delivered_at": datetime.now(UTC),
+                        "callback_retry_at": None,
+                    }
+                )
                 db.commit()
         return True
 
@@ -229,8 +298,8 @@ class WorkspaceWorker:
         service: str,
         operation: str,
         is_write: bool,
-        payload: Dict[str, Any],
-    ) -> Dict[str, Any]:
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
         """Execute workspace operation with strict prepare vs execute separation."""
         from app.workspace.idempotency import IdempotencyManager
         from app.workspace.service import WorkspaceError
@@ -254,15 +323,54 @@ class WorkspaceWorker:
         if self.background:
             from app.workspace.drive_knowledge import drive_documents
 
+            if (
+                getattr(self.settings, "DRIVE_INDEX_ENABLED", False)
+                and action == "index"
+                and service == "drive"
+            ):
+                from app.workspace.drive_permissions import link_payload
+                from app.workspace.drive_runtime import PREVIEW, RESYNC
+
+                if operation == PREVIEW:
+                    return {
+                        "status": "completed",
+                        "result": await self.drive_runtime.process_preview(user_id, payload),
+                    }
+                link = await asyncio.to_thread(self.drive_runtime._link, user_id)
+                if link is None or link_payload(link) != payload.get("drive_link"):
+                    raise WorkspaceError("RECONNECT_REQUIRED", "Liên kết Google đã thay đổi.")
+                if operation == RESYNC:
+                    from app.workspace.drive_scanner import DriveScanner
+
+                    scanner = DriveScanner(self.session_factory, workspace_svc)
+                    complete = await asyncio.to_thread(
+                        scanner.daily_reconcile, link, max_pages=4, force=True
+                    )
+                    return {
+                        "status": "completed",
+                        "result": {"status": "ok", "scan_complete": complete},
+                    }
+                if operation == "index.fetch":
+                    file_id = req_values["parameters"].get("fileId")
+                    from app.workspace.drive_knowledge import FILE_ID
+
+                    if not isinstance(file_id, str) or not FILE_ID.fullmatch(file_id):
+                        raise WorkspaceError("INVALID_BACKGROUND_JOB", "Cần ID tệp Drive hợp lệ.")
+                    await self.drive_runtime.index_file(link, file_id)
+                    return {"status": "completed", "result": {"status": "ok"}}
+
             if action != "index" or service != "drive" or operation != "index.fetch":
                 raise WorkspaceError("INVALID_BACKGROUND_JOB", "Tác vụ Drive nền không hợp lệ.")
-            workspace_svc.use_mcp = False
             file_id = req_values["parameters"].get("fileId")
             from app.workspace.drive_knowledge import FILE_ID
+
             if not isinstance(file_id, str) or not FILE_ID.fullmatch(file_id):
                 raise WorkspaceError("INVALID_BACKGROUND_JOB", "Cần ID tệp Drive hợp lệ.")
             result = await asyncio.to_thread(drive_documents, workspace_svc, user_id, [], file_id)
             return {"status": "completed", "result": result}
+
+        if action == "read" and service == "workspace" and operation == "plan.read":
+            return {"status": "completed", "result": await self.run_read_plan(user_id, payload)}
 
         if action == "read" and service == "drive" and operation == "knowledge.search":
             from app.workspace.drive_knowledge import FILE_ID, drive_documents
@@ -270,13 +378,37 @@ class WorkspaceWorker:
             terms = req_values["parameters"].get("terms", [])
             file_id = req_values["parameters"].get("file_id")
             question = req_values["body"].get("question")
-            if (not isinstance(question, str) or not question.strip() or len(question) > 12000
-                    or not isinstance(terms, list) or len(terms) > 8
-                    or any(not isinstance(term, str) or len(term) > 80 for term in terms)
-                    or (file_id is not None and (not isinstance(file_id, str) or not FILE_ID.fullmatch(file_id)))):
+            if (
+                not isinstance(question, str)
+                or not question.strip()
+                or len(question) > 12000
+                or not isinstance(terms, list)
+                or len(terms) > 8
+                or any(not isinstance(term, str) or len(term) > 80 for term in terms)
+                or (
+                    file_id is not None
+                    and (not isinstance(file_id, str) or not FILE_ID.fullmatch(file_id))
+                )
+            ):
                 raise WorkspaceError("INVALID_REQUEST", "Yêu cầu tìm tài liệu không hợp lệ.")
-            workspace_svc.use_mcp = False
-            result = await asyncio.to_thread(drive_documents, workspace_svc, user_id, terms, file_id)
+            if getattr(self.settings, "DRIVE_INDEX_ENABLED", False):
+                expected = payload.get("drive_link")
+                if not expected:
+                    from app.workspace.drive_runtime import response
+
+                    result = response("connection_error")
+                else:
+                    result = await self.drive_runtime.search(
+                        user_id,
+                        question,
+                        file_id=file_id,
+                        terms=terms,
+                        expected=expected,
+                    )
+            else:
+                result = await asyncio.to_thread(
+                    drive_documents, workspace_svc, user_id, terms, file_id
+                )
             result["question"] = question
             return {"status": "completed", "result": result}
 
@@ -288,22 +420,36 @@ class WorkspaceWorker:
         elif action == "execute":
             # EXECUTE: Requires valid _ticket and operation_id
             if not ticket:
-                raise WorkspaceError("MISSING_TICKET", "Execute operation requires a valid _ticket from prepare step")
+                raise WorkspaceError(
+                    "MISSING_TICKET", "Execute operation requires a valid _ticket from prepare step"
+                )
             if not op_id:
-                raise WorkspaceError("MISSING_OPERATION_ID", "Execute operation requires operation_id for idempotency")
+                raise WorkspaceError(
+                    "MISSING_OPERATION_ID",
+                    "Execute operation requires operation_id for idempotency",
+                )
 
             idemp_mgr = IdempotencyManager()
             with self.session_factory() as idemp_db:
                 rec, claimed = idemp_mgr.claim(idemp_db, user_id, op_id, payload)
                 if rec.status == "completed":
                     import json
+
                     cached_data = json.loads(rec.response_json) if rec.response_json else {}
-                    return {"action": "execute", "status": "completed", "result": cached_data, "cached": True}
+                    return {
+                        "action": "execute",
+                        "status": "completed",
+                        "result": cached_data,
+                        "cached": True,
+                    }
                 if not claimed:
-                    raise WorkspaceError("UNKNOWN_RESULT", "Thao tác đang xử lý hoặc cần đối soát; không gửi lại.")
+                    raise WorkspaceError(
+                        "UNKNOWN_RESULT", "Thao tác đang xử lý hoặc cần đối soát; không gửi lại."
+                    )
 
             exec_payload = dict(req_values)
             exec_payload["_ticket"] = ticket
+
             # Run real mutation call
             def execute_and_record():
                 # The thread can outlive the async deadline. Persist a confirmed response
@@ -325,12 +471,22 @@ class WorkspaceWorker:
                     job_key = trace.job_id if trace else None
                     if job_key:
                         idemp_db.query(WorkspaceJob).filter_by(
-                            job_id=job_key, user_id=user_id, operation_id=op_id,
+                            job_id=job_key,
+                            user_id=user_id,
+                            operation_id=op_id,
                             status=WorkspaceJobStatus.UNKNOWN_RESULT.value,
-                        ).update({"status": WorkspaceJobStatus.COMPLETED.value,
-                                  "result_encrypted": _encrypt_data(result, self.settings.ENCRYPTION_KEY),
-                                  "error_code": None, "error_message": None,
-                                  "callback_delivered_at": None, "callback_retry_at": datetime.now(UTC)})
+                        ).update(
+                            {
+                                "status": WorkspaceJobStatus.COMPLETED.value,
+                                "result_encrypted": _encrypt_data(
+                                    result, self.settings.ENCRYPTION_KEY
+                                ),
+                                "error_code": None,
+                                "error_message": None,
+                                "callback_delivered_at": None,
+                                "callback_retry_at": datetime.now(UTC),
+                            }
+                        )
                         idemp_db.commit()
                 return result
 
@@ -343,8 +499,58 @@ class WorkspaceWorker:
             res = await asyncio.to_thread(workspace_svc.read, user_id, service, req_values)
             return {"action": "read", "status": "completed", "result": res}
 
+    async def run_read_plan(self, user_id, payload):
+        from time import monotonic
+
+        from app.workspace.drive_permissions import matches_link
+        from app.workspace.network_slots import request_deadline
+        from app.workspace.service import WorkspaceError
+
+        link = payload.get("drive_link")
+        with self.session_factory() as db:
+            if not matches_link(db, user_id, link):
+                raise WorkspaceError("RECONNECT_REQUIRED", "Liên kết Google đã thay đổi.")
+        settings = self.settings
+        base_url = settings.AI_AGENT_BASE_URL.rstrip("/")
+        if not base_url or not settings.GATEWAY_TO_AGENT_SECRET:
+            raise WorkspaceError("SERVICE_ERROR", "Agent chưa được cấu hình.")
+        deadline = request_deadline.get()
+        remaining = deadline - monotonic() if deadline is not None else 0
+        if remaining <= 0:
+            raise WorkspaceError("DEADLINE_EXCEEDED", "Kế hoạch đã hết hạn.")
+        try:
+            result = await self._http_client.post(
+                f"{base_url}/internal/v1/workspace/read-plan",
+                headers={"Authorization": f"Bearer {settings.GATEWAY_TO_AGENT_SECRET}"},
+                json={
+                    "user_id": user_id, "steps": payload["body"]["steps"],
+                    "telegram_user_id": payload["telegram_user_id"],
+                    "chat_id": payload["telegram_chat_id"],
+                    "binding_id": payload["telegram_binding_id"],
+                    "link": link, "remaining_seconds": remaining,
+                },
+                timeout=remaining,
+            )
+            if result.status_code == 403:
+                raise WorkspaceError("PERMISSION_DENIED", "Liên kết hoặc quyền đọc đã thay đổi.")
+            if result.status_code == 422:
+                raise WorkspaceError("INVALID_REQUEST", "Agent từ chối kế hoạch đọc.")
+            result.raise_for_status()
+            data = result.json()
+            if (not isinstance(data, dict) or not isinstance(data.get("steps"), list)
+                    or type(data.get("partial")) is not bool):
+                raise ValueError("Invalid read plan response")
+        except (httpx.HTTPError, ValueError) as exc:
+            raise WorkspaceError("SERVICE_ERROR", "Không thể hoàn tất kế hoạch đọc qua Agent.") from exc
+        return {"format": "workspace_plan_v1", "link": link, "steps": data["steps"],
+                "partial": data["partial"]}
+
     async def send_callback(self, job: WorkspaceJob, result_data: Any) -> bool:
         """Notify AI Agent via webhook callback of job completion."""
+        if job.service == "workspace" and job.operation == "plan.read":
+            created = job.created_at
+            if created and datetime.now(UTC) - created.replace(tzinfo=created.tzinfo or UTC) >= timedelta(hours=24):
+                return True
         agent_url = getattr(self.settings, "AI_AGENT_BASE_URL", "").rstrip("/")
         agent_secret = getattr(self.settings, "GATEWAY_TO_AGENT_SECRET", "")
         if not agent_url or not agent_secret:
@@ -357,9 +563,20 @@ class WorkspaceWorker:
         }
         saved = _decrypt_data(job.payload_encrypted, self.settings.ENCRYPTION_KEY) or {}
         binding = saved.get("telegram_binding_id")
-        if job.telegram_chat_id is not None:
-            with self.session_factory() as db:
-                if not valid_recipient(db, job.user_id, job.telegram_user_id, job.telegram_chat_id, binding):
+        indexed = isinstance(result_data, dict) and result_data.get("format") in {
+            "indexed_drive_v1", "workspace_plan_v1",
+        }
+        drive_link = result_data.get("link") if indexed else None
+        drive_verification = result_data.get("verification", []) if indexed else []
+        with self.session_factory() as db:
+            if drive_link:
+                from app.workspace.drive_runtime import safe_result
+
+                result_data = safe_result(db, job.user_id, result_data)
+            if job.telegram_chat_id is not None:
+                if not valid_recipient(
+                    db, job.user_id, job.telegram_user_id, job.telegram_chat_id, binding
+                ):
                     return True
         callback_body = {
             "job_id": job.job_id,
@@ -381,16 +598,26 @@ class WorkspaceWorker:
             if resp.status_code != 200:
                 return False
             if binding:
-                self.queue_telegram_result(job, binding, resp.json().get("messages", []))
+                self.queue_telegram_result(
+                    job,
+                    binding,
+                    resp.json().get("messages", []),
+                    drive_link=drive_link,
+                    drive_verification=drive_verification,
+                )
             return True
         except Exception as exc:
             logger.warning(f"Failed to deliver callback to Agent for job {job.job_id}: {exc}")
             return False
 
-    def queue_telegram_result(self, job, binding, messages, *, progress=False):
-        from app.telegram.client import normalize_agent_response
-        from sqlalchemy.exc import IntegrityError
+    def queue_telegram_result(
+        self, job, binding, messages, *, progress=False, drive_link=None, drive_verification=()
+    ):
         import hashlib
+
+        from sqlalchemy.exc import IntegrityError
+
+        from app.telegram.client import normalize_agent_response
 
         delivery = normalize_agent_response(messages)
         if not delivery["messages"]:
@@ -403,18 +630,55 @@ class WorkspaceWorker:
             delivery_key += ":unknown_result"
         update_id = -int.from_bytes(hashlib.sha256(delivery_key.encode()).digest()[:7], "big") - 1
         with self.session_factory() as db:
-            if not valid_recipient(db, job.user_id, job.telegram_user_id, job.telegram_chat_id, binding):
+            if not valid_recipient(
+                db, job.user_id, job.telegram_user_id, job.telegram_chat_id, binding
+            ):
                 return
-            if progress and not db.query(WorkspaceJob.id).filter_by(job_id=job.job_id).filter(
-                WorkspaceJob.status.in_(["queued", "running"]),
-            ).with_for_update().first():
+            if drive_link:
+                from app.workspace.drive_permissions import delivery_evidence_current
+
+                if not delivery_evidence_current(db, job.user_id, drive_link, drive_verification):
+                    return
+                delivery["drive_link"] = drive_link
+                delivery["drive_verification"] = drive_verification
+                if job.service == "workspace" and job.operation == "plan.read":
+                    created = job.created_at.replace(tzinfo=job.created_at.tzinfo or UTC)
+                    delivery["expires_at_unix"] = (created + timedelta(hours=24)).timestamp()
+            if (
+                progress
+                and not db.query(WorkspaceJob.id)
+                .filter_by(job_id=job.job_id)
+                .filter(
+                    WorkspaceJob.status.in_(["queued", "running"]),
+                )
+                .with_for_update()
+                .first()
+            ):
                 return
             if db.query(TelegramUpdate.id).filter_by(update_id=update_id).first():
                 return
-            db.add(TelegramUpdate(update_id=update_id, user_id=job.user_id, status="ai_received",
-                                 delivery_status="ready", ai_response=json.dumps(delivery, ensure_ascii=False),
-                                 payload=json.dumps({"message": {"chat": {"id": job.telegram_chat_id},
-                                                                  "from": {"id": job.telegram_user_id}}})))
+            stored_delivery = json.dumps(delivery, ensure_ascii=False)
+            if drive_link:
+                stored_delivery = "drive1:" + encrypt_secret(
+                    stored_delivery, self.settings.ENCRYPTION_KEY
+                )
+            db.add(
+                TelegramUpdate(
+                    update_id=update_id,
+                    user_id=job.user_id,
+                    status="ai_received",
+                    delivery_status="ready",
+                    ai_response=stored_delivery,
+                    payload=json.dumps(
+                        {
+                            "message": {
+                                "chat": {"id": job.telegram_chat_id},
+                                "from": {"id": job.telegram_user_id},
+                            }
+                        }
+                    ),
+                )
+            )
             try:
                 db.commit()
             except IntegrityError:
@@ -425,21 +689,66 @@ class WorkspaceWorker:
     def notify_slow_jobs(self):
         now = datetime.now(UTC)
         with self.session_factory() as db:
-            jobs = db.query(WorkspaceJob).filter(
-                WorkspaceJob.status.in_(["queued", "running"]), WorkspaceJob.deadline_at > now,
-                WorkspaceJob.created_at <= now - timedelta(seconds=30),
-                WorkspaceJob.telegram_chat_id.is_not(None),
-                WorkspaceJob.phase.is_distinct_from("progress_queued"),
-            ).limit(20).all()
+            jobs = (
+                db.query(WorkspaceJob)
+                .filter(
+                    WorkspaceJob.status.in_(["queued", "running"]),
+                    WorkspaceJob.deadline_at > now,
+                    WorkspaceJob.created_at <= now - timedelta(seconds=30),
+                    WorkspaceJob.telegram_chat_id.is_not(None),
+                    WorkspaceJob.phase.is_distinct_from("progress_queued"),
+                )
+                .limit(20)
+                .all()
+            )
         for job in jobs:
             payload = _decrypt_data(job.payload_encrypted, self.settings.ENCRYPTION_KEY) or {}
             binding = payload.get("telegram_binding_id")
             if binding:
-                self.queue_telegram_result(job, binding, [f"Tác vụ Workspace (#{job.job_id}) vẫn đang xử lý."],
-                                           progress=True)
+                self.queue_telegram_result(
+                    job,
+                    binding,
+                    [f"Tác vụ Workspace (#{job.job_id}) vẫn đang xử lý."],
+                    progress=True,
+                )
             with self.session_factory() as db:
                 db.query(WorkspaceJob).filter_by(id=job.id).update({"phase": "progress_queued"})
                 db.commit()
+
+    def purge_expired_read_plans(self):
+        cutoff = datetime.now(UTC) - timedelta(hours=24)
+        with self.session_factory.begin() as db:
+            expired = (
+                db.query(WorkspaceJob)
+                .filter_by(service="workspace", operation="plan.read")
+                .filter(WorkspaceJob.created_at <= cutoff, WorkspaceJob.payload_encrypted != "")
+                .limit(100)
+                .with_for_update(skip_locked=True)
+                .all()
+            )
+            for job in expired:
+                job.payload_encrypted = ""
+                job.result_encrypted = None
+                job.callback_retry_at = None
+                if job.status in {"queued", "running"}:
+                    job.status = WorkspaceJobStatus.EXPIRED.value
+            deliveries = (
+                db.query(TelegramUpdate)
+                .filter(
+                    TelegramUpdate.created_at <= cutoff,
+                    TelegramUpdate.ai_response.like("drive1:%"),
+                    TelegramUpdate.delivery_status != "sending",
+                )
+                .limit(100)
+                .with_for_update(skip_locked=True)
+                .all()
+            )
+            for delivery in deliveries:
+                delivery.ai_response = None
+                delivery.delivery_chunks = None
+                if delivery.status == "ai_received":
+                    delivery.status = "failed"
+                    delivery.delivery_status = "failed"
 
     async def process_one_cycle(self) -> bool:
         """Claim and execute a single job."""
@@ -458,8 +767,9 @@ class WorkspaceWorker:
             attempt = job.retry_count
 
         payload_dict = _decrypt_data(raw_payload, key) or {}
-        from app.workspace.telemetry import ExecutionTelemetry, active_execution, telemetry_store
         import time
+
+        from app.workspace.telemetry import ExecutionTelemetry, active_execution, telemetry_store
 
         queue_wait = 0.0
         if job.created_at:
@@ -468,11 +778,17 @@ class WorkspaceWorker:
                 created_dt = created_dt.replace(tzinfo=UTC)
             queue_wait = max(0.0, (datetime.now(UTC) - created_dt).total_seconds() * 1000.0)
 
-        trace = ExecutionTelemetry(request_id=job.request_id, job_id=job_id,
-                                   operation_id=payload_dict.get("operation_id"), service=service,
-                                   operation=operation, queue_wait_ms=queue_wait)
+        trace = ExecutionTelemetry(
+            request_id=job.request_id,
+            job_id=job_id,
+            operation_id=payload_dict.get("operation_id"),
+            service=service,
+            operation=operation,
+            queue_wait_ms=queue_wait,
+        )
         trace_token = active_execution.set(trace)
-        from app.workspace.network_slots import before_write, network_slots
+        from app.workspace.network_slots import before_write, network_slots, request_deadline
+
         slot_token = network_slots.set(self.network_slots)
         t_start = time.perf_counter()
         heartbeat = asyncio.create_task(self.heartbeat(job_id, attempt))
@@ -486,20 +802,31 @@ class WorkspaceWorker:
             nonlocal dispatch_started
             with dispatch_lock:
                 if dispatch_closed or datetime.now(UTC) >= deadline:
-                    raise WorkspaceError("DEADLINE_EXCEEDED", "Tác vụ đã hết hạn trước khi gửi thao tác ghi.")
+                    raise WorkspaceError(
+                        "DEADLINE_EXCEEDED", "Tác vụ đã hết hạn trước khi gửi thao tác ghi."
+                    )
                 dispatch_started = True
 
         write_token = before_write.set(guard_write)
+        deadline_token = None
         try:
             from app.workspace.service import WorkspaceError
 
             deadline = deadline if deadline.tzinfo else deadline.replace(tzinfo=UTC)
             remaining = (deadline - datetime.now(UTC)).total_seconds()
-            mutation = payload_dict.get("action") == "execute" or (is_write and bool(payload_dict.get("_ticket")))
+            deadline_token = request_deadline.set(time.monotonic() + remaining)
+            mutation = payload_dict.get("action") == "execute" or (
+                is_write and bool(payload_dict.get("_ticket"))
+            )
             if job.telegram_chat_id is not None:
                 with self.session_factory() as db:
-                    if not valid_recipient(db, user_id, job.telegram_user_id, job.telegram_chat_id,
-                                           payload_dict.get("telegram_binding_id")):
+                    if not valid_recipient(
+                        db,
+                        user_id,
+                        job.telegram_user_id,
+                        job.telegram_chat_id,
+                        payload_dict.get("telegram_binding_id"),
+                    ):
                         raise WorkspaceError("RECONNECT_REQUIRED", "Liên kết Telegram đã thay đổi.")
             else:
                 with self.session_factory() as db:
@@ -510,18 +837,27 @@ class WorkspaceWorker:
 
                 with self.session_factory() as db:
                     record = IdempotencyManager().get_record(db, payload_dict["operation_id"])
-                    if record is not None and (record.user_id != user_id
-                                               or record.payload_hash != compute_payload_hash(payload_dict)):
-                        raise WorkspaceError("OPERATION_CONFLICT", "operation_id đã thuộc thao tác khác.")
+                    if record is not None and (
+                        record.user_id != user_id
+                        or record.payload_hash != compute_payload_hash(payload_dict)
+                    ):
+                        raise WorkspaceError(
+                            "OPERATION_CONFLICT", "operation_id đã thuộc thao tác khác."
+                        )
                     if record is not None and record.status != "completed":
-                        raise WorkspaceError("UNKNOWN_RESULT", "Worker trước có thể đã gửi thao tác ghi. Cần đối soát.")
+                        raise WorkspaceError(
+                            "UNKNOWN_RESULT",
+                            "Worker trước có thể đã gửi thao tác ghi. Cần đối soát.",
+                        )
             elif attempt > 1 and mutation:
                 raise WorkspaceError("UNKNOWN_RESULT", "Thiếu mã để đối soát thao tác ghi.")
             if remaining <= 0:
                 raise WorkspaceError("DEADLINE_EXCEEDED", "Tác vụ đã hết hạn trước khi thực thi.")
             try:
                 async with asyncio.timeout(remaining):
-                    exec_outcome = await self.execute_job_payload(user_id, service, operation, is_write, payload_dict)
+                    exec_outcome = await self.execute_job_payload(
+                        user_id, service, operation, is_write, payload_dict
+                    )
             except TimeoutError as exc:
                 with dispatch_lock:
                     dispatch_closed = True
@@ -550,6 +886,8 @@ class WorkspaceWorker:
             with dispatch_lock:
                 dispatch_closed = True
             before_write.reset(write_token)
+            if deadline_token is not None:
+                request_deadline.reset(deadline_token)
             heartbeat.cancel()
             with suppress(asyncio.CancelledError):
                 await heartbeat
@@ -563,9 +901,15 @@ class WorkspaceWorker:
 
     async def run(self) -> None:
         """Continuous worker execution loop."""
+        from time import monotonic
+
         self._running = True
+        next_cleanup = 0.0
         while self._running:
             try:
+                if not self.background and monotonic() >= next_cleanup:
+                    next_cleanup = monotonic() + 300
+                    await asyncio.to_thread(self.purge_expired_read_plans)
                 processed = await self.process_one_cycle()
                 processed = await self.deliver_pending_callback() or processed
                 if not processed:
@@ -592,7 +936,9 @@ class WorkspaceWorker:
                 pass
         if hasattr(self, "workspace_svc") and self.workspace_svc:
             self.workspace_svc.close()
+        if getattr(self, "_drive_runtime", None) is not None:
+            await self._drive_runtime.close()
         if hasattr(self, "google_client") and self.google_client:
             self.google_client.close()
+            await self.google_client.unified_client.close()
         await self._http_client.aclose()
-
